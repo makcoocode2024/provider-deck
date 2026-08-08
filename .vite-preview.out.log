@@ -1,0 +1,20 @@
+
+> provider-deck@0.1.0 dev
+> vite --mode test --host 127.0.0.1
+
+
+  [32m[1mVITE[22m v7.3.6[39m  [42m [1mtest[22m [49m  [2mready in [0m[1m1038[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m1420[22m/[39m
+[2m21:47:17[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/html5ever-0.38.0/data/bench/lipsum-zh.html[22m
+[2m21:47:17[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/html5ever-0.38.0/data/bench/lipsum.html[22m
+[2m21:47:17[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/html5ever-0.38.0/data/bench/medium-fragment.html[22m
+[2m21:47:17[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/html5ever-0.38.0/data/bench/small-fragment.html[22m
+[2m21:47:17[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/html5ever-0.38.0/data/bench/strong.html[22m
+[2m21:47:17[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/html5ever-0.38.0/data/bench/tiny-fragment.html[22m
+[2m21:47:31[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/cssparser-0.36.0/docs/404.html[22m
+[2m21:47:32[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/cssparser-0.36.0/docs/index.html[22m
+[2m21:47:36[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/wry-0.55.1/examples/custom_protocol/index.html[22m
+[2m21:47:36[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/wry-0.55.1/examples/custom_protocol/subpage.html[22m
+[2m21:47:36[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/wry-0.55.1/examples/streaming/index.html[22m
+[2m21:51:28[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mpage reload [39m[2m.cargo-home/registry/src/rsproxy.cn-e3de039b2554c837/window-vibrancy-0.6.0/examples/tauri/public/index.html[22m

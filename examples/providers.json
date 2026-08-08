@@ -1,0 +1,13 @@
+[
+  {
+    "id": "example-only",
+    "name": "示例 OpenAI-compatible 服务",
+    "baseUrl": "https://api.example.com/v1",
+    "protocol": "openai",
+    "enabled": true,
+    "isCurrent": false,
+    "models": [],
+    "connectionState": "untested",
+    "appliedClients": []
+  }
+]

@@ -1,0 +1,23 @@
+import { defineConfig } from "vitest/config";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    exclude: ["e2e/**", "node_modules/**", "dist/**", "src-tauri/target/**"],
+  },
+  clearScreen: false,
+  server: {
+    port: 1420,
+    strictPort: true,
+    watch: {
+      ignored: ["**/src-tauri/target/**", "**/.cargo-home/**", "**/test-results/**"],
+    },
+  },
+  envPrefix: ["VITE_", "TAURI_"],
+  build: {
+    target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
+    minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
+    sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
+  },
+});

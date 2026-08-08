@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+src-tauri/target/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.bak
+*.tsbuildinfo
+!.github/**/*.yml

@@ -1,0 +1,23 @@
+node:internal/fs/watchers:321
+    const error = new UVException({
+                  ^
+
+Error: EBUSY: resource busy or locked, watch 'G:\分屏器\src-tauri\target\debug\deps\provider_deck_lib-2703ebd259aa644c.exe'
+    at FSWatcher.<computed> (node:internal/fs/watchers:321:19)
+    at Object.watch (node:fs:2548:36)
+    at createFsWatchInstance (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:12958:16)
+    at setFsWatchListener (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:13000:14)
+    at NodeFsHandler$1._watchWithNodeFs (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:13114:20)
+    at NodeFsHandler$1._handleFile (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:13158:24)
+    at NodeFsHandler$1._addToNodeFs (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:13332:26)
+Emitted 'error' event on FSWatcher instance at:
+    at FSWatcher._handleError (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:14133:148)
+    at NodeFsHandler$1._addToNodeFs (file:///G:/%E5%88%86%E5%B1%8F%E5%99%A8/node_modules/vite/dist/node/chunks/config.js:13337:18) {
+  errno: -4082,
+  syscall: 'watch',
+  code: 'EBUSY',
+  path: 'G:\\分屏器\\src-tauri\\target\\debug\\deps\\provider_deck_lib-2703ebd259aa644c.exe',
+  filename: 'G:\\分屏器\\src-tauri\\target\\debug\\deps\\provider_deck_lib-2703ebd259aa644c.exe'
+}
+
+Node.js v24.16.0

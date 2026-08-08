@@ -1,0 +1,42 @@
+[package]
+name = "provider-deck"
+version = "0.1.11"
+description = "Local-first AI provider configuration manager"
+authors = ["Provider Deck contributors"]
+edition = "2021"
+
+[lib]
+name = "provider_deck_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "system-proxy", "stream"] }
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread", "net"] }
+axum = { version = "0.8", features = ["json", "http1", "tokio"] }
+async-stream = "0.3"
+eventsource-stream = "0.2"
+futures-util = "0.3"
+bytes = "1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+directories = "6"
+which = "8"
+toml_edit = "0.23"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3"
+httpmock = "0.7"
