@@ -25,7 +25,7 @@ fn read_text(path: &Path) -> AppResult<String> {
     if path.exists() { fs::read_to_string(path).map_err(Into::into) } else { Ok(String::new()) }
 }
 
-fn merge_codex(existing: &str, provider: &Provider, secret: &str) -> AppResult<String> {
+fn merge_codex(existing: &str, provider: &Provider, secret: &str, settings: &AppSettings) -> AppResult<String> {
     let mut doc = if existing.trim().is_empty() { DocumentMut::new() } else { DocumentMut::from_str(existing).map_err(|e| AppError::Config(format!("Codex TOML 解析失败：{e}")))? };
     let id = slug(provider);
     doc["model_provider"] = value(id.clone());
@@ -41,7 +41,7 @@ fn merge_codex(existing: &str, provider: &Provider, secret: &str) -> AppResult<S
         let context_window = provider.models.iter().find(|item| &item.id == model).and_then(|item| item.context_window).unwrap_or(200_000);
         doc["model"] = value(model.clone());
         doc["model_context_window"] = value(context_window as i64);
-        doc["model_reasoning_effort"] = value("high");
+        doc["model_reasoning_effort"] = value(settings.effective_reasoning_level.as_str());
         doc["model_supports_reasoning_summaries"] = value(false);
         doc["model_reasoning_summary"] = value("none");
     }
@@ -79,7 +79,7 @@ pub fn repair_legacy_codex_catalog() -> AppResult<bool> {
     Ok(true)
 }
 
-fn codex_catalog(provider: &Provider) -> AppResult<String> {
+fn codex_catalog(provider: &Provider, settings: &AppSettings) -> AppResult<String> {
     let mut models = provider.models.clone();
     if let Some(default_model) = &provider.default_model {
         if !models.iter().any(|model| &model.id == default_model) {
@@ -91,6 +91,7 @@ fn codex_catalog(provider: &Provider) -> AppResult<String> {
                 source: "manual".into(),
                 capabilities: Vec::new(),
                 context_window: None,
+                parameter_count_billions: None,
             });
         }
     }
@@ -100,7 +101,7 @@ fn codex_catalog(provider: &Provider) -> AppResult<String> {
             "slug": model.id,
             "display_name": model.display_name,
             "description": format!("{} via Provider Deck", model.display_name),
-            "default_reasoning_level": "high",
+            "default_reasoning_level": settings.effective_reasoning_level.as_str(),
             "supported_reasoning_levels": [
                 { "effort": "minimal", "description": "Fastest responses with minimal reasoning" },
                 { "effort": "low", "description": "Fast responses with lighter reasoning" },
@@ -286,9 +287,9 @@ fn merge_opencode(existing: &str, provider: &Provider, secret: &str) -> AppResul
     serde_json::to_string_pretty(&root).map_err(|e| AppError::Config(e.to_string()))
 }
 
-fn generated(client_id: &str, existing: &str, provider: &Provider, secret: &str) -> AppResult<String> {
+fn generated(client_id: &str, existing: &str, provider: &Provider, secret: &str, settings: &AppSettings) -> AppResult<String> {
     match client_id {
-        "codex-cli" => merge_codex(existing, provider, secret),
+        "codex-cli" => merge_codex(existing, provider, secret, settings),
         "claude-code" => merge_claude(existing, provider, secret),
         "opencode" => merge_opencode(existing, provider, secret),
         _ => Err(AppError::Config("该客户端仅支持手动配置".into())),
@@ -309,14 +310,14 @@ fn can_configure(client_id: &str, provider: &Provider) -> bool {
         && !(client_id == "codex-cli" && matches!(provider.codex_compatibility, CodexCompatibility::ResponsesUnsupported))
 }
 
-pub fn preview(provider: &Provider, client_ids: &[String]) -> AppResult<Vec<ConfigChange>> {
+pub fn preview(provider: &Provider, client_ids: &[String], settings: &AppSettings) -> AppResult<Vec<ConfigChange>> {
     let catalog = clients::detect_all();
     client_ids.iter().map(|client_id| {
         let client = catalog.iter().find(|item| &item.id == client_id).ok_or_else(|| AppError::InvalidInput(format!("未知客户端：{client_id}")))?;
         let path = clients::config_path(client_id);
         let existing = path.as_deref().map(read_text).transpose()?.unwrap_or_default();
         let can_write = client.auto_config && can_configure(client_id, provider);
-        let after = if can_write { generated(client_id, &existing, provider, "<API_KEY：写入时从系统凭据库读取>")? } else { client.guidance.clone() };
+        let after = if can_write { generated(client_id, &existing, provider, "<API_KEY：写入时从系统凭据库读取>", settings)? } else { client.guidance.clone() };
         let mut warnings = Vec::new();
         if can_write { warnings.push("该客户端需要在配置文件中保存密钥。仅在关闭“只生成配置”并确认后才会写入明文，文件权限将尽可能收紧。".into()); }
         if client_id == "codex-cli" {
@@ -364,9 +365,9 @@ pub fn apply(provider: &Provider, secret: &str, changes: &[ConfigChange], settin
         let current_hash = file_hash(&path)?;
         if change.expected_hash.as_deref() != Some(current_hash.as_str()) { return Err(AppError::ExternalModification); }
         let existing = read_text(&path)?;
-        let output = generated(&change.client_id, &existing, provider, secret)?;
+        let output = generated(&change.client_id, &existing, provider, secret, settings)?;
         let backup = create_backup(&change.client_id, &path)?;
-        let catalog_artifact = if change.client_id == "codex-cli" { Some((codex_catalog_path()?, codex_catalog(provider)?)) } else { None };
+        let catalog_artifact = if change.client_id == "codex-cli" { Some((codex_catalog_path()?, codex_catalog(provider, settings)?)) } else { None };
         let catalog_backup = catalog_artifact.as_ref().map(|(catalog_path, _)| create_backup("codex-cli-model-catalog", catalog_path)).transpose()?;
         if let Some((catalog_path, catalog)) = &catalog_artifact {
             if let Err(error) = atomic_replace(catalog_path, catalog.as_bytes()).and_then(|_| restrict_permissions(catalog_path)) {
@@ -422,7 +423,7 @@ mod tests {
     fn provider() -> Provider { Provider { id: "12345678-test".into(), name: "Example".into(), base_url: "https://api.example.com/v1".into(), protocol: ProtocolKind::Openai, enabled: true, is_current: true, default_model: Some("coder".into()), claude_model_profile: None, claude_extended_context: false, claude_model_mappings: ClaudeModelMappings::default(), codex_compatibility: CodexCompatibility::Full, codex_probe_model: Some("coder".into()), codex_probe_detail: None, models: vec![], connection_state: "connected".into(), confidence: Some(0.9), last_checked_at: None, applied_clients: vec![], error_summary: None } }
     #[test]
     fn codex_merge_preserves_unknown_fields() {
-        let output = merge_codex("custom_flag = true\n", &provider(), "secret").unwrap();
+        let output = merge_codex("custom_flag = true\n", &provider(), "secret", &AppSettings::default()).unwrap();
         assert!(output.contains("custom_flag = true"));
         let document = DocumentMut::from_str(&output).unwrap();
         assert_eq!(document["model_providers"]["example"]["name"].as_str(), Some("Example"));
@@ -430,7 +431,7 @@ mod tests {
         assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
         assert_eq!(document["model_supports_reasoning_summaries"].as_bool(), Some(false));
         assert!(document["model_catalog_json"].as_str().is_some_and(|path| path.ends_with("provider-deck-model-catalog.json")));
-        let catalog: Value = serde_json::from_str(&codex_catalog(&provider()).unwrap()).unwrap();
+        let catalog: Value = serde_json::from_str(&codex_catalog(&provider(), &AppSettings::default()).unwrap()).unwrap();
         assert_eq!(catalog["models"][0]["slug"], "coder");
         assert_eq!(catalog["models"][0]["default_reasoning_level"], "high");
         assert_eq!(catalog["models"][0]["supported_reasoning_levels"].as_array().unwrap().len(), 4);
@@ -440,7 +441,7 @@ mod tests {
     fn codex_catalog_omits_patch_type_when_custom_probe_is_not_full() {
         let mut provider = provider();
         provider.codex_compatibility = CodexCompatibility::FunctionToolsOnly;
-        let catalog: Value = serde_json::from_str(&codex_catalog(&provider).unwrap()).unwrap();
+        let catalog: Value = serde_json::from_str(&codex_catalog(&provider, &AppSettings::default()).unwrap()).unwrap();
         assert!(catalog["models"][0].get("apply_patch_tool_type").is_none());
     }
     #[test]
@@ -486,7 +487,7 @@ mod tests {
         custom.default_model = Some("third-party-coding-model".into());
         custom.claude_model_profile = Some(ClaudeModelProfile::Opus);
         custom.claude_extended_context = true;
-        custom.models = vec![crate::model::ModelInfo { id: "third-party-coding-model".into(), display_name: "Third Party Coding Model".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: Some(1_000_000) }];
+        custom.models = vec![crate::model::ModelInfo { id: "third-party-coding-model".into(), display_name: "Third Party Coding Model".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: Some(1_000_000), parameter_count_billions: None }];
         let output = merge_claude("{}", &custom, "secret").unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["model"], "opus");
@@ -504,8 +505,8 @@ mod tests {
         custom.claude_model_profile = Some(ClaudeModelProfile::Sonnet);
         custom.claude_model_mappings = ClaudeModelMappings { sonnet: Some("agnes-2.0-flash".into()), opus: Some("deep-coder".into()), haiku: None };
         custom.models = vec![
-            crate::model::ModelInfo { id: "agnes-2.0-flash".into(), display_name: "Agnes Flash".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None },
-            crate::model::ModelInfo { id: "deep-coder".into(), display_name: "Deep Coder".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None },
+            crate::model::ModelInfo { id: "agnes-2.0-flash".into(), display_name: "Agnes Flash".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None, parameter_count_billions: None },
+            crate::model::ModelInfo { id: "deep-coder".into(), display_name: "Deep Coder".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None, parameter_count_billions: None },
         ];
         let output = merge_claude(r#"{"env":{"ANTHROPIC_MODEL":"agnes-2.0-flash","ANTHROPIC_DEFAULT_HAIKU_MODEL":"old-model","ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME":"Old","ANTHROPIC_DEFAULT_FABLE_MODEL":"claude-fable-5","ANTHROPIC_CUSTOM_MODEL_OPTION":"old-custom","CLAUDE_CODE_SUBAGENT_MODEL":"old-subagent"}}"#, &custom, "secret").unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();

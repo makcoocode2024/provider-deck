@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::Infallible, net::{Ipv4Addr, SocketAddr}, sync::{Arc, Mutex, RwLock}};
+use std::{collections::HashMap, convert::Infallible, net::{Ipv4Addr, SocketAddr}, sync::{Arc, RwLock}};
 
 use async_stream::stream;
 use axum::{
@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::{
+    activity,
+    chat_store::ChatStore,
     error::{AppError, AppResult},
     model::{AppSettings, Provider},
     responses_chat::{chat_to_response, responses_to_chat, StreamAdapter},
@@ -28,12 +30,12 @@ struct ProxyRoute {
     api_key: String,
     local_token: String,
     client: Client,
+    reasoning_effort: String,
 }
 
-#[derive(Default)]
 struct ProxyState {
     routes: RwLock<HashMap<String, ProxyRoute>>,
-    conversations: Mutex<HashMap<String, Vec<Value>>>,
+    chats: ChatStore,
 }
 
 pub struct LocalProxy {
@@ -42,7 +44,7 @@ pub struct LocalProxy {
 }
 
 impl LocalProxy {
-    pub fn start(preferred_port: Option<u16>) -> AppResult<Self> {
+    pub fn start(preferred_port: Option<u16>, chats: ChatStore) -> AppResult<Self> {
         let bind = |port| std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port));
         let listener = match preferred_port.filter(|port| *port > 0) {
             Some(port) => bind(port).or_else(|_| bind(0))?,
@@ -50,7 +52,7 @@ impl LocalProxy {
         };
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
-        let state = Arc::new(ProxyState::default());
+        let state = Arc::new(ProxyState { routes: RwLock::new(HashMap::new()), chats });
         let server_state = Arc::clone(&state);
         tauri::async_runtime::spawn(async move {
             let Ok(listener) = tokio::net::TcpListener::from_std(listener) else { return; };
@@ -83,6 +85,7 @@ impl LocalProxy {
             api_key: api_key.to_string(),
             local_token: local_token.to_string(),
             client: builder.build().map_err(|error| AppError::Network(error.to_string()))?,
+            reasoning_effort: settings.effective_reasoning_level.as_str().into(),
         };
         self.state.routes.write().map_err(|_| AppError::Config("本地代理路由锁已损坏".into()))?.insert(provider.id.clone(), route);
         Ok(())
@@ -120,7 +123,7 @@ async fn handle_responses(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(provider_id): Path<String>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Json(mut payload): Json<Value>,
 ) -> Response<Body> {
     if !peer.ip().is_loopback() { return json_error(StatusCode::FORBIDDEN, "本地代理只接受环回连接"); }
     let route = match state.routes.read().ok().and_then(|routes| routes.get(&provider_id).cloned()) {
@@ -129,9 +132,13 @@ async fn handle_responses(
     };
     if bearer(&headers) != Some(route.local_token.as_str()) { return json_error(StatusCode::UNAUTHORIZED, "本地代理令牌无效"); }
 
-    let previous_messages = payload.get("previous_response_id").and_then(Value::as_str).and_then(|id| {
-        state.conversations.lock().ok().and_then(|conversations| conversations.get(id).cloned())
-    });
+    if let Some(object) = payload.as_object_mut() {
+        let reasoning = object.entry("reasoning").or_insert_with(|| json!({}));
+        if let Some(reasoning) = reasoning.as_object_mut() {
+            reasoning.insert("effort".into(), Value::String(route.reasoning_effort.clone()));
+        }
+    }
+    let previous_messages = payload.get("previous_response_id").and_then(Value::as_str).and_then(|id| state.chats.get(id));
     if payload.get("previous_response_id").is_some() && previous_messages.is_none() {
         return json_error(StatusCode::CONFLICT, "previous_response_id 不属于当前代理进程；请开启新会话");
     }
@@ -173,9 +180,8 @@ async fn handle_responses(
         if let Some(response_id) = response.get("id").and_then(Value::as_str) {
             let mut conversation = chat_messages;
             if let Some(message) = chat.pointer("/choices/0/message") { conversation.push(message.clone()); }
-            if let Ok(mut conversations) = state.conversations.lock() {
-                if conversations.len() >= 128 { if let Some(key) = conversations.keys().next().cloned() { conversations.remove(&key); } }
-                conversations.insert(response_id.to_string(), conversation);
+            if let Err(error) = state.chats.record(response_id.to_string(), conversation) {
+                activity::record("chat_cache_write", &error.to_string(), false);
             }
         }
         Response::builder()
@@ -231,11 +237,8 @@ fn stream_response(
         for event in adapter.finish() { yield Ok(Bytes::from(event)); }
         let mut conversation = chat_messages;
         conversation.push(assistant_message);
-        if let Ok(mut conversations) = state.conversations.lock() {
-            if conversations.len() >= 128 {
-                if let Some(key) = conversations.keys().next().cloned() { conversations.remove(&key); }
-            }
-            conversations.insert(response_id, conversation);
+        if let Err(error) = state.chats.record(response_id, conversation) {
+            activity::record("chat_cache_write", &error.to_string(), false);
         }
     };
     Response::builder()
@@ -302,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn translates_custom_tool_and_preserves_upstream_auth_boundary() {
         let (upstream_base, server) = spawn_upstream(200, r#"{"id":"chatcmpl-test","model":"dynamic-model","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"pd_custom_48458d4adc_apply_patch","arguments":"{\"input\":\"patch\"}"}}]},"finish_reason":"tool_calls"}]}"#);
-        let proxy = LocalProxy::start(None).unwrap();
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
         let provider = test_provider(upstream_base);
         proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
         let client = Client::new();
@@ -324,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn passes_upstream_error_status_and_body_to_codex() {
         let (upstream_base, server) = spawn_upstream(401, r#"{"error":{"message":"upstream denied"}}"#);
-        let proxy = LocalProxy::start(None).unwrap();
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
         let provider = test_provider(upstream_base);
         proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
         let response = Client::new().post(format!("{}/responses", proxy.provider_base_url(&provider.id)))
@@ -344,7 +347,7 @@ mod tests {
             "data: [DONE]\n\n"
         );
         let (upstream_base, server) = spawn_upstream(200, upstream_sse);
-        let proxy = LocalProxy::start(None).unwrap();
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
         let provider = test_provider(upstream_base);
         proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
         let response = Client::new().post(format!("{}/responses", proxy.provider_base_url(&provider.id)))

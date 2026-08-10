@@ -134,6 +134,39 @@ export interface BackupRecord {
   size: number;
 }
 
+export type ChatRestoreMode = "merge" | "replace";
+
+export interface ChatBackupRecord {
+  id: string;
+  fileName: string;
+  path: string;
+  createdAt: string;
+  size: number;
+  conversationCount: number;
+  version: number;
+}
+
+export interface ChatCacheSummary {
+  conversationCount: number;
+  currentSessionCount: number;
+  historicalConversationCount: number;
+  messageCount: number;
+  cachePath: string;
+  backupDirectory: string;
+  cacheStatus: "available" | "missing" | "damaged";
+  cacheMessage?: string;
+}
+
+export interface ChatRestoreResult {
+  success: boolean;
+  message: string;
+  importedCount: number;
+  totalCount: number;
+  currentSessionCount: number;
+  historicalConversationCount: number;
+  rollbackSnapshotId?: string;
+}
+
 export interface AppSettings {
   timeoutSeconds: number;
   proxyUrl: string;

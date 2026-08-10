@@ -13,3 +13,8 @@ src-tauri/target/
 *.bak
 *.tsbuildinfo
 !.github/**/*.yml
+.cargo-home/
+.codex-catalog-probe-*/
+artifacts/
+release/
+发布包/

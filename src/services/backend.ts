@@ -4,6 +4,10 @@ import type {
   AppSettings,
   ApplyResult,
   BackupRecord,
+  ChatBackupRecord,
+  ChatCacheSummary,
+  ChatRestoreMode,
+  ChatRestoreResult,
   ClientDescriptor,
   ConfigChange,
   ProbeResult,
@@ -29,6 +33,12 @@ export interface AppBackend {
   applyChanges(providerId: string, changes: ConfigChange[]): Promise<ApplyResult[]>;
   listBackups(): Promise<BackupRecord[]>;
   restoreBackup(id: string): Promise<void>;
+  listChatBackups(): Promise<ChatBackupRecord[]>;
+  chatCacheSummary(): Promise<ChatCacheSummary>;
+  exportChatBackup(): Promise<ChatBackupRecord>;
+  restoreChatBackupPayload(payload: string, mode: ChatRestoreMode): Promise<ChatRestoreResult>;
+  restoreChatCache(mode: ChatRestoreMode): Promise<ChatRestoreResult>;
+  rollbackChatRestore(snapshotId: string): Promise<ChatRestoreResult>;
   getSettings(): Promise<AppSettings>;
   saveSettings(settings: AppSettings): Promise<void>;
   exportProviders(): Promise<string>;
@@ -56,6 +66,12 @@ class TauriBackend implements AppBackend {
     invoke<ApplyResult[]>("apply_changes", { providerId, changes });
   listBackups = () => invoke<BackupRecord[]>("list_backups");
   restoreBackup = (id: string) => invoke<void>("restore_backup", { id });
+  listChatBackups = () => invoke<ChatBackupRecord[]>("list_chat_backups");
+  chatCacheSummary = () => invoke<ChatCacheSummary>("chat_cache_summary");
+  exportChatBackup = () => invoke<ChatBackupRecord>("export_chat_backup");
+  restoreChatBackupPayload = (payload: string, mode: ChatRestoreMode) => invoke<ChatRestoreResult>("restore_chat_backup_payload", { payload, mode });
+  restoreChatCache = (mode: ChatRestoreMode) => invoke<ChatRestoreResult>("restore_chat_cache", { mode });
+  rollbackChatRestore = (snapshotId: string) => invoke<ChatRestoreResult>("rollback_chat_restore", { snapshotId });
   getSettings = () => invoke<AppSettings>("get_settings");
   saveSettings = (settings: AppSettings) => invoke<void>("save_settings", { settings });
   exportProviders = () => invoke<string>("export_providers");
@@ -251,6 +267,41 @@ class BrowserBackend implements AppBackend {
 
   async listBackups() { return []; }
   async restoreBackup(id: string) { void id; this.ensureTestMode(); }
+  async listChatBackups() { return [] as ChatBackupRecord[]; }
+  async chatCacheSummary(): Promise<ChatCacheSummary> {
+    return {
+      conversationCount: 0,
+      currentSessionCount: 0,
+      historicalConversationCount: 0,
+      messageCount: 0,
+      cachePath: "浏览器测试模式不读取本机缓存",
+      backupDirectory: "浏览器测试模式不写入备份目录",
+      cacheStatus: "missing",
+    };
+  }
+  async exportChatBackup(): Promise<ChatBackupRecord> {
+    this.ensureTestMode();
+    return {
+      id: crypto.randomUUID(), fileName: "provider-deck-codex-chats-test.pdbchat.json", path: "浏览器测试模式",
+      createdAt: new Date().toISOString(), size: 0, conversationCount: 0, version: 3,
+    };
+  }
+  async restoreChatBackupPayload(payload: string, mode: ChatRestoreMode): Promise<ChatRestoreResult> {
+    void payload;
+    void mode;
+    this.ensureTestMode();
+    return { success: false, message: "浏览器测试模式不读取本机加密聊天备份。请使用 Tauri 桌面版。", importedCount: 0, totalCount: 0, currentSessionCount: 0, historicalConversationCount: 0 };
+  }
+  async restoreChatCache(mode: ChatRestoreMode): Promise<ChatRestoreResult> {
+    void mode;
+    this.ensureTestMode();
+    return { success: false, message: "浏览器测试模式不读取本机 Codex 聊天缓存。请使用 Tauri 桌面版。", importedCount: 0, totalCount: 0, currentSessionCount: 0, historicalConversationCount: 0 };
+  }
+  async rollbackChatRestore(snapshotId: string): Promise<ChatRestoreResult> {
+    void snapshotId;
+    this.ensureTestMode();
+    return { success: false, message: "浏览器测试模式不支持恢复回滚。请使用 Tauri 桌面版。", importedCount: 0, totalCount: 0, currentSessionCount: 0, historicalConversationCount: 0 };
+  }
   async getSettings() {
     return JSON.parse(localStorage.getItem(this.settingsKey) ?? JSON.stringify(defaultSettings));
   }

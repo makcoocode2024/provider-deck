@@ -184,6 +184,22 @@ fn context_window(item: &Value) -> Option<u64> {
     .find_map(|pointer| item.pointer(pointer).and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok())))
 }
 
+fn parameter_count_billions(item: &Value) -> Option<f64> {
+    [
+        "/parameter_count_billions",
+        "/parameterCountBillions",
+        "/parameters_billions",
+        "/metadata/parameter_count_billions",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        let value = item.pointer(pointer)?;
+        value.as_f64().or_else(|| {
+            value.as_str()?.trim().trim_end_matches(['B', 'b']).parse::<f64>().ok()
+        })
+    })
+}
+
 pub async fn probe(draft: &ProviderDraft, settings: &AppSettings) -> AppResult<ProbeResult> {
     let base = normalize_base_url(&draft.base_url)?;
     let url = Url::parse(&base).map_err(|_| AppError::InvalidInput("Base URL 格式无效".into()))?;
@@ -439,7 +455,7 @@ async fn probe_openai(client: &Client, base: &str, key: &str) -> Result<(String,
     let body: Value = response.json().await.map_err(|e| (target.clone(), format!("响应不是有效 JSON：{e}")))?;
     if !status.is_success() { return Err((target, classify_status(status, &body))); }
     let data = body.get("data").and_then(Value::as_array).ok_or_else(|| (target.clone(), "响应缺少 data 模型数组".into()))?;
-    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: item.get("owned_by").and_then(Value::as_str).map(str::to_owned), protocol: ProtocolKind::Openai, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item) })).collect();
+    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: item.get("owned_by").and_then(Value::as_str).map(str::to_owned), protocol: ProtocolKind::Openai, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item) })).collect();
     let confidence = if headers.contains_key("openai-version") || body.get("object").and_then(Value::as_str) == Some("list") { 0.98 } else { 0.88 };
     Ok((target, models, confidence))
 }
@@ -452,7 +468,7 @@ async fn probe_anthropic(client: &Client, base: &str, key: &str) -> Result<(Stri
     let body: Value = response.json().await.map_err(|e| (target.clone(), format!("响应不是有效 JSON：{e}")))?;
     if !status.is_success() { return Err((target, classify_status(status, &body))); }
     let data = body.get("data").and_then(Value::as_array).ok_or_else(|| (target.clone(), "响应缺少 data 模型数组".into()))?;
-    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Anthropic-compatible".into()), protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item) })).collect();
+    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Anthropic-compatible".into()), protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item) })).collect();
     let confidence = if headers.keys().any(|name| name.as_str().starts_with("anthropic-")) || data.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("model")) { 0.98 } else { 0.86 };
     Ok((target, models, confidence))
 }
@@ -464,7 +480,7 @@ async fn probe_gemini(client: &Client, base: &str, key: &str) -> Result<(String,
     let body: Value = response.json().await.map_err(|e| (target.clone(), format!("响应不是有效 JSON：{e}")))?;
     if !status.is_success() { return Err((target, classify_status(status, &body))); }
     let data = body.get("models").and_then(Value::as_array).ok_or_else(|| (target.clone(), "响应缺少 models 数组".into()))?;
-    let models = data.iter().filter_map(|item| item.get("name")?.as_str().map(|name| { let id = name.strip_prefix("models/").unwrap_or(name); ModelInfo { id: id.into(), display_name: item.get("displayName").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Gemini-compatible".into()), protocol: ProtocolKind::Gemini, source: "server".into(), capabilities: item.get("supportedGenerationMethods").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(), context_window: context_window(item) } })).collect();
+    let models = data.iter().filter_map(|item| item.get("name")?.as_str().map(|name| { let id = name.strip_prefix("models/").unwrap_or(name); ModelInfo { id: id.into(), display_name: item.get("displayName").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Gemini-compatible".into()), protocol: ProtocolKind::Gemini, source: "server".into(), capabilities: item.get("supportedGenerationMethods").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item) } })).collect();
     Ok((target, models, 0.98))
 }
 
@@ -533,6 +549,11 @@ mod tests {
         assert_eq!(context_window(&serde_json::json!({ "context_window": 1_000_000 })), Some(1_000_000));
         assert_eq!(context_window(&serde_json::json!({ "contextLength": 128_000 })), Some(128_000));
         assert_eq!(context_window(&serde_json::json!({ "limits": { "context_window": "256000" } })), Some(256_000));
+    }
+    #[test]
+    fn reads_parameter_count_metadata() {
+        assert_eq!(parameter_count_billions(&serde_json::json!({ "parameter_count_billions": 70 })), Some(70.0));
+        assert_eq!(parameter_count_billions(&serde_json::json!({ "metadata": { "parameter_count_billions": "32B" } })), Some(32.0));
     }
 
     #[tokio::test]

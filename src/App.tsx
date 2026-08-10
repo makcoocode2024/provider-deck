@@ -3,6 +3,7 @@ import { ArchiveRestore, Bot, Braces, ChevronRight, CircleHelp, FileUp, Gauge, K
 import { useEffect, useState } from "react";
 import type { Provider } from "./domain/types";
 import { ConfigPreview } from "./components/ConfigPreview";
+import { ChatHistoryDialog } from "./components/ChatHistoryDialog";
 import { ProviderWizard } from "./components/ProviderWizard";
 import { AboutPage, BackupsPage, ClientsPage, DiagnosticsPage, ImportExportPage, ProvidersPage, SettingsPage } from "./components/Pages";
 import { useAppStore } from "./state/useAppStore";
@@ -33,6 +34,7 @@ export default function App() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [targetProvider, setTargetProvider] = useState<Provider>();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [chatHistoryOpen, setChatHistoryOpen] = useState(false);
 
   useEffect(() => { hydrate(); }, [hydrate]);
   useEffect(() => {
@@ -78,7 +80,7 @@ export default function App() {
         <div className="sidebar-status"><ShieldAlert size={18} /><span><strong>本地优先</strong><small>无遥测 · 凭据隔离</small></span></div>
       </aside>
       <main className="main-area">
-        <header className="topbar"><button className="icon-button mobile-only" title="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div className="current-service"><span className={providers.some((item) => item.isCurrent) ? "status-dot connected" : "status-dot untested"} /><span><small>当前服务</small><strong>{providers.find((item) => item.isCurrent)?.name ?? "未配置"}</strong></span></div><div className="top-actions"><button className="button quiet"><KeyRound size={16} />凭据已保护</button><button className="button primary" onClick={openAdd}><Plus size={17} />添加服务</button></div></header>
+        <header className="topbar"><button className="icon-button mobile-only" title="打开导航" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div className="current-service"><span className={providers.some((item) => item.isCurrent) ? "status-dot connected" : "status-dot untested"} /><span><small>当前服务</small><strong>{providers.find((item) => item.isCurrent)?.name ?? "未配置"}</strong></span></div><div className="top-actions"><button className="button quiet"><KeyRound size={16} />凭据已保护</button><button className="button" onClick={() => setChatHistoryOpen(true)}><ArchiveRestore size={16} />恢复历史聊天记录</button><button className="button primary" onClick={openAdd}><Plus size={17} />添加服务</button></div></header>
         {loading ? <div className="loading-screen"><div className="brand-symbol pulse"><Braces size={22} /></div><p>正在读取本机配置状态…</p></div> : content()}
       </main>
     </div>
@@ -86,5 +88,6 @@ export default function App() {
     {error && <div className="error-toast" role="alert"><div><strong>操作未完成</strong><span>{error}</span></div><button className="icon-button" title="关闭" onClick={clearError}><X size={17} /></button></div>}
     <ProviderWizard open={wizardOpen} initial={editing} firstRun={firstRun} onOpenChange={setWizardOpen} onSaved={(provider) => { setTargetProvider(provider); setFirstRun(false); setWizardOpen(false); setPage("clients"); }} />
     <ConfigPreview open={previewOpen} provider={targetProvider} onOpenChange={setPreviewOpen} />
+    <ChatHistoryDialog open={chatHistoryOpen} onOpenChange={setChatHistoryOpen} />
   </Tooltip.Provider>;
 }

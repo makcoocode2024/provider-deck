@@ -51,6 +51,30 @@ pub struct ModelInfo {
     pub source: String,
     pub capabilities: Vec<String>,
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub parameter_count_billions: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for ReasoningLevel {
+    fn default() -> Self { Self::High }
+}
+
+impl ReasoningLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +230,14 @@ pub struct AppSettings {
     pub locale: String,
     #[serde(default)]
     pub local_proxy_port: Option<u16>,
+    #[serde(default)]
+    pub auto_reasoning_mode: bool,
+    #[serde(default)]
+    pub manual_reasoning_level: ReasoningLevel,
+    #[serde(default)]
+    pub effective_reasoning_level: ReasoningLevel,
+    #[serde(default)]
+    pub reasoning_match_message: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -218,6 +250,10 @@ impl Default for AppSettings {
             clear_clipboard_seconds: 30,
             locale: "zh-CN".into(),
             local_proxy_port: None,
+            auto_reasoning_mode: false,
+            manual_reasoning_level: ReasoningLevel::High,
+            effective_reasoning_level: ReasoningLevel::High,
+            reasoning_match_message: None,
         }
     }
 }

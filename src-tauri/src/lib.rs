@@ -1,3 +1,5 @@
+mod activity;
+mod chat_store;
 mod clients;
 mod config;
 mod credentials;
@@ -7,6 +9,7 @@ mod local_proxy;
 mod responses_chat;
 mod protocol;
 mod redaction;
+mod reasoning;
 mod storage;
 
 use std::collections::HashMap;
@@ -18,9 +21,16 @@ use tauri::{
 };
 use uuid::Uuid;
 use error::{AppError, AppResult};
+use chat_store::{ChatBackupRecord, ChatCacheSummary, ChatRestoreMode, ChatRestoreResult, ChatStore};
 use model::{AppSettings, ApplyResult, BackupRecord, ClientDescriptor, ConfigChange, ProbeResult, Provider, ProviderDraft, ProviderTestReport};
 use local_proxy::LocalProxy;
 use storage::StateStore;
+
+fn refresh_current_reasoning(state: &mut model::PersistedState, log_action: bool) {
+    let current = state.providers.iter().find(|provider| provider.is_current).cloned()
+        .or_else(|| state.providers.first().cloned());
+    reasoning::refresh_settings(&mut state.settings, current.as_ref(), log_action);
+}
 
 #[tauri::command]
 fn list_providers(store: State<'_, StateStore>) -> Vec<Provider> { store.read().providers }
@@ -66,11 +76,13 @@ async fn save_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy
         };
         state.providers.retain(|item| item.id != id);
         state.providers.push(provider.clone());
+        refresh_current_reasoning(state, true);
         Ok(provider)
     })?;
+    let effective_settings = store.read().settings;
     if matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy) {
         let token = credentials::proxy_token(&provider.id)?;
-        proxy.register(&provider, &resolved_draft.api_key, &token, &settings)?;
+        proxy.register(&provider, &resolved_draft.api_key, &token, &effective_settings)?;
     } else {
         proxy.unregister(&provider.id);
     }
@@ -85,12 +97,20 @@ fn delete_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, i
 }
 
 #[tauri::command]
-fn set_current_provider(store: State<'_, StateStore>, id: String) -> AppResult<Vec<Provider>> {
-    store.update(|state| {
-        if !state.providers.iter().any(|provider| provider.id == id) { return Err(AppError::ProviderNotFound(id)); }
+fn set_current_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, id: String) -> AppResult<Vec<Provider>> {
+    let providers = store.update(|state| {
+        if !state.providers.iter().any(|provider| provider.id == id) { return Err(AppError::ProviderNotFound(id.clone())); }
         for provider in &mut state.providers { provider.is_current = provider.id == id; }
+        refresh_current_reasoning(state, true);
         Ok(state.providers.clone())
-    })
+    })?;
+    let state = store.read();
+    if let Some(provider) = state.providers.iter().find(|provider| provider.is_current)
+        .filter(|provider| matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy)) {
+        proxy.register(provider, &credentials::get(&provider.id)?, &credentials::proxy_token(&provider.id)?, &state.settings)?;
+    }
+    activity::record("provider_switch", &format!("切换当前 Provider：{id}"), true);
+    Ok(providers)
 }
 
 #[tauri::command]
@@ -126,23 +146,27 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
     match protocol::probe(&draft, &settings).await {
         Ok(probe) => {
             let refreshed = store.update(|state| {
-            let saved = state.providers.iter_mut().find(|item| item.id == id)
-                .ok_or_else(|| AppError::ProviderNotFound(id.clone()))?;
-            saved.base_url = probe.normalized_base_url;
-            saved.protocol = probe.protocol;
-            saved.models = probe.models;
-            saved.codex_compatibility = probe.codex_compatibility;
-            saved.codex_probe_model = probe.codex_probe_model;
-            saved.codex_probe_detail = probe.codex_probe_detail;
-            saved.default_model = saved.default_model.clone().filter(|model| saved.models.iter().any(|item| &item.id == model)).or_else(|| saved.models.first().map(|model| model.id.clone()));
-            saved.claude_model_mappings.sonnet = saved.claude_model_mappings.sonnet.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
-            saved.claude_model_mappings.opus = saved.claude_model_mappings.opus.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
-            saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
-            saved.connection_state = "connected".into();
-            saved.confidence = Some(probe.confidence);
-            saved.last_checked_at = Some(Utc::now().to_rfc3339());
-            saved.error_summary = None;
-            Ok(saved.clone())
+                let refreshed = {
+                    let saved = state.providers.iter_mut().find(|item| item.id == id)
+                        .ok_or_else(|| AppError::ProviderNotFound(id.clone()))?;
+                    saved.base_url = probe.normalized_base_url;
+                    saved.protocol = probe.protocol;
+                    saved.models = probe.models;
+                    saved.codex_compatibility = probe.codex_compatibility;
+                    saved.codex_probe_model = probe.codex_probe_model;
+                    saved.codex_probe_detail = probe.codex_probe_detail;
+                    saved.default_model = saved.default_model.clone().filter(|model| saved.models.iter().any(|item| &item.id == model)).or_else(|| saved.models.first().map(|model| model.id.clone()));
+                    saved.claude_model_mappings.sonnet = saved.claude_model_mappings.sonnet.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                    saved.claude_model_mappings.opus = saved.claude_model_mappings.opus.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                    saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                    saved.connection_state = "connected".into();
+                    saved.confidence = Some(probe.confidence);
+                    saved.last_checked_at = Some(Utc::now().to_rfc3339());
+                    saved.error_summary = None;
+                    saved.clone()
+                };
+                refresh_current_reasoning(state, true);
+                Ok(refreshed)
             })?;
             if matches!(refreshed.codex_compatibility, model::CodexCompatibility::ChatProxy) {
                 let token = credentials::proxy_token(&refreshed.id)?;
@@ -192,20 +216,24 @@ async fn refresh_provider_models(store: State<'_, StateStore>, provider_id: Stri
     let draft = provider_draft(&provider, api_key, &settings);
     match protocol::fetch_models(&draft, &settings).await {
         Ok((_target, models, confidence)) => store.update(|state| {
-            let saved = state.providers.iter_mut().find(|item| item.id == provider_id)
-                .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
-            saved.models = models;
-            saved.default_model = saved.default_model.clone()
-                .filter(|model| saved.models.iter().any(|item| &item.id == model))
-                .or_else(|| saved.models.first().map(|model| model.id.clone()));
-            saved.claude_model_mappings.sonnet = saved.claude_model_mappings.sonnet.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
-            saved.claude_model_mappings.opus = saved.claude_model_mappings.opus.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
-            saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
-            saved.connection_state = "connected".into();
-            saved.confidence = Some(confidence);
-            saved.last_checked_at = Some(Utc::now().to_rfc3339());
-            saved.error_summary = None;
-            Ok(saved.clone())
+            let refreshed = {
+                let saved = state.providers.iter_mut().find(|item| item.id == provider_id)
+                    .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+                saved.models = models;
+                saved.default_model = saved.default_model.clone()
+                    .filter(|model| saved.models.iter().any(|item| &item.id == model))
+                    .or_else(|| saved.models.first().map(|model| model.id.clone()));
+                saved.claude_model_mappings.sonnet = saved.claude_model_mappings.sonnet.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                saved.claude_model_mappings.opus = saved.claude_model_mappings.opus.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                saved.connection_state = "connected".into();
+                saved.confidence = Some(confidence);
+                saved.last_checked_at = Some(Utc::now().to_rfc3339());
+                saved.error_summary = None;
+                saved.clone()
+            };
+            refresh_current_reasoning(state, true);
+            Ok(refreshed)
         }),
         Err(error) => {
             let summary = error.to_string();
@@ -236,18 +264,19 @@ fn detect_clients() -> Vec<ClientDescriptor> { clients::detect_all() }
 
 #[tauri::command]
 fn preview_changes(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, provider_id: String, client_ids: Vec<String>) -> AppResult<Vec<ConfigChange>> {
-    let provider = store.read().providers.into_iter().find(|provider| provider.id == provider_id).ok_or(AppError::ProviderNotFound(provider_id))?;
+    let state = store.read();
+    let provider = state.providers.iter().find(|provider| provider.id == provider_id).cloned().ok_or(AppError::ProviderNotFound(provider_id))?;
     if matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy) && client_ids.iter().any(|id| id == "codex-cli") {
         let mut changes = Vec::new();
         let codex_ids = vec!["codex-cli".to_string()];
         let mut effective = provider.clone();
         effective.base_url = proxy.provider_base_url(&provider.id);
-        changes.extend(config::preview(&effective, &codex_ids)?);
+        changes.extend(config::preview(&effective, &codex_ids, &state.settings)?);
         let other_ids = client_ids.into_iter().filter(|id| id != "codex-cli").collect::<Vec<_>>();
-        if !other_ids.is_empty() { changes.extend(config::preview(&provider, &other_ids)?); }
+        if !other_ids.is_empty() { changes.extend(config::preview(&provider, &other_ids, &state.settings)?); }
         Ok(changes)
     } else {
-        config::preview(&provider, &client_ids)
+        config::preview(&provider, &client_ids, &state.settings)
     }
 }
 
@@ -296,15 +325,47 @@ fn restore_backup(store: State<'_, StateStore>, id: String) -> AppResult<()> {
 fn get_settings(store: State<'_, StateStore>) -> AppSettings { store.read().settings }
 
 #[tauri::command]
-fn save_settings(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, mut settings: AppSettings) -> AppResult<()> {
+fn save_settings(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, mut settings: AppSettings) -> AppResult<AppSettings> {
     if settings.timeout_seconds < 3 || settings.timeout_seconds > 120 { return Err(AppError::InvalidInput("超时必须在 3 到 120 秒之间".into())); }
     settings.local_proxy_port = Some(proxy.port());
-    for provider in store.read().providers.iter().filter(|provider| matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy)) {
+    let providers = store.read().providers;
+    let current = providers.iter().find(|provider| provider.is_current).or_else(|| providers.first());
+    reasoning::refresh_settings(&mut settings, current, true);
+    for provider in providers.iter().filter(|provider| matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy)) {
         let api_key = credentials::get(&provider.id)?;
         let token = credentials::proxy_token(&provider.id)?;
         proxy.register(provider, &api_key, &token, &settings)?;
     }
-    store.update(|state| { state.settings = settings; Ok(()) })
+    store.update(|state| { state.settings = settings.clone(); Ok(settings) })
+}
+
+#[tauri::command]
+fn list_chat_backups(chats: State<'_, ChatStore>) -> AppResult<Vec<ChatBackupRecord>> { chats.list_backups() }
+
+#[tauri::command]
+fn chat_cache_summary(chats: State<'_, ChatStore>) -> ChatCacheSummary { chats.summary() }
+
+#[tauri::command]
+fn export_chat_backup(chats: State<'_, ChatStore>) -> AppResult<ChatBackupRecord> { chats.export_backup() }
+
+#[tauri::command]
+fn restore_chat_backup_file(chats: State<'_, ChatStore>, path: String, mode: String) -> AppResult<ChatRestoreResult> {
+    Ok(chats.restore_from_file(std::path::Path::new(&path), ChatRestoreMode::parse(&mode)?))
+}
+
+#[tauri::command]
+fn restore_chat_backup_payload(chats: State<'_, ChatStore>, payload: String, mode: String) -> AppResult<ChatRestoreResult> {
+    Ok(chats.restore_from_payload(&payload, ChatRestoreMode::parse(&mode)?))
+}
+
+#[tauri::command]
+fn restore_chat_cache(chats: State<'_, ChatStore>, mode: String) -> AppResult<ChatRestoreResult> {
+    Ok(chats.restore_from_cache(ChatRestoreMode::parse(&mode)?))
+}
+
+#[tauri::command]
+fn rollback_chat_restore(chats: State<'_, ChatStore>, snapshot_id: String) -> ChatRestoreResult {
+    chats.rollback(&snapshot_id)
 }
 
 #[tauri::command]
@@ -328,7 +389,8 @@ pub fn run() {
     let _ = config::repair_legacy_codex_catalog();
     let store = StateStore::load().expect("failed to initialize Provider Deck state");
     let snapshot = store.read();
-    let proxy = LocalProxy::start(snapshot.settings.local_proxy_port).expect("failed to start Provider Deck local proxy");
+    let chats = ChatStore::load().expect("failed to initialize Provider Deck chat store");
+    let proxy = LocalProxy::start(snapshot.settings.local_proxy_port, chats.clone()).expect("failed to start Provider Deck local proxy");
     if snapshot.settings.local_proxy_port != Some(proxy.port()) {
         store.update(|state| { state.settings.local_proxy_port = Some(proxy.port()); Ok(()) }).expect("failed to persist local proxy port");
     }
@@ -338,6 +400,7 @@ pub fn run() {
         }
     }
     tauri::Builder::default()
+    .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
         let open = MenuItem::with_id(app, "open", "打开 Provider Deck", true, None::<&str>)?;
         let hide = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
@@ -377,10 +440,11 @@ pub fn run() {
             let _ = window.hide();
         }
     })
-    .manage(store).manage(proxy).invoke_handler(tauri::generate_handler![
+    .manage(store).manage(proxy).manage(chats).invoke_handler(tauri::generate_handler![
         list_providers, get_provider_api_key, save_provider, delete_provider, set_current_provider, probe_provider, reprobe_provider, detect_clients,
         refresh_provider_models, test_provider,
         preview_changes, apply_changes, list_backups, restore_backup, get_settings, save_settings,
+        list_chat_backups, chat_cache_summary, export_chat_backup, restore_chat_backup_file, restore_chat_backup_payload, restore_chat_cache, rollback_chat_restore,
         export_providers, import_providers, diagnostics
     ]).run(tauri::generate_context!()).expect("error while running Provider Deck");
 }
