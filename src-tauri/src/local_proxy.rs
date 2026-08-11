@@ -296,6 +296,15 @@ mod tests {
         (format!("http://{address}/v1"), handle)
     }
 
+    /// 按 RFC 7230 大小写无关地取头部值：hyper 直发时是全小写 `authorization:`，
+    /// 而经过会规范化头名的中间代理时会变成 `Authorization:`，断言不能依赖大小写。
+    fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.split("\r\n\r\n").next()?.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
     #[test]
     fn appends_chat_endpoint_without_duplicate_v1() {
         assert_eq!(chat_endpoint("https://example.com/v1").unwrap(), "https://example.com/v1/chat/completions");
@@ -319,7 +328,8 @@ mod tests {
         assert_eq!(converted["output"][0]["name"], "apply_patch");
         let request = server.join().unwrap();
         assert!(request.contains("POST /v1/chat/completions"));
-        assert!(request.contains("Authorization: Bearer upstream-secret"));
+        assert_eq!(header_value(&request, "authorization"), Some("Bearer upstream-secret"));
+        assert!(!request.contains("local-secret"), "本地代理令牌不得随请求泄露给上游");
         assert!(!request.contains("\"type\":\"custom\""));
         assert!(!request.contains("\"type\":\"namespace\""));
     }
