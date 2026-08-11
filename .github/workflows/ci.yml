@@ -30,6 +30,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # libwebkit2gtk-4.1-dev 传递带来 glib-sys / gtk-sys / soup3-sys / webkit2gtk-sys 需要的
+      # pkg-config 文件；libdbus-1-dev 供 keyring 的 sync-secret-service 特性链接 libdbus-sys。
+      # 托盘的 libappindicator-sys 走运行时 dlopen，构建期无需 appindicator dev 包。
+      - name: Install Linux system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libdbus-1-dev
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
   bundle:
