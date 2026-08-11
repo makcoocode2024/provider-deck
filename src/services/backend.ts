@@ -40,7 +40,7 @@ export interface AppBackend {
   restoreChatCache(mode: ChatRestoreMode): Promise<ChatRestoreResult>;
   rollbackChatRestore(snapshotId: string): Promise<ChatRestoreResult>;
   getSettings(): Promise<AppSettings>;
-  saveSettings(settings: AppSettings): Promise<void>;
+  saveSettings(settings: AppSettings): Promise<AppSettings>;
   exportProviders(): Promise<string>;
   importProviders(payload: string): Promise<Provider[]>;
   diagnostics(): Promise<Record<string, string>>;
@@ -73,7 +73,7 @@ class TauriBackend implements AppBackend {
   restoreChatCache = (mode: ChatRestoreMode) => invoke<ChatRestoreResult>("restore_chat_cache", { mode });
   rollbackChatRestore = (snapshotId: string) => invoke<ChatRestoreResult>("rollback_chat_restore", { snapshotId });
   getSettings = () => invoke<AppSettings>("get_settings");
-  saveSettings = (settings: AppSettings) => invoke<void>("save_settings", { settings });
+  saveSettings = (settings: AppSettings) => invoke<AppSettings>("save_settings", { settings });
   exportProviders = () => invoke<string>("export_providers");
   importProviders = (payload: string) => invoke<Provider[]>("import_providers", { payload });
   diagnostics = () => invoke<Record<string, string>>("diagnostics");
@@ -302,14 +302,21 @@ class BrowserBackend implements AppBackend {
     this.ensureTestMode();
     return { success: false, message: "浏览器测试模式不支持恢复回滚。请使用 Tauri 桌面版。", importedCount: 0, totalCount: 0, currentSessionCount: 0, historicalConversationCount: 0 };
   }
-  async getSettings() {
-    return JSON.parse(localStorage.getItem(this.settingsKey) ?? JSON.stringify(defaultSettings));
+  async getSettings(): Promise<AppSettings> {
+    const stored = localStorage.getItem(this.settingsKey);
+    return { ...defaultSettings, ...(stored ? JSON.parse(stored) : {}) };
   }
   async saveSettings(settings: AppSettings) {
     if (localStorage.getItem("provider-deck.e2e.fail-settings-save") === "1") {
       throw new Error("测试后端模拟设置保存失败");
     }
-    localStorage.setItem(this.settingsKey, JSON.stringify(settings));
+    const resolved: AppSettings = {
+      ...settings,
+      effectiveReasoningLevel: settings.manualReasoningLevel,
+      reasoningMatchMessage: settings.autoReasoningMode ? "浏览器测试模式不读取模型元数据和显存，暂时沿用手动档位" : undefined,
+    };
+    localStorage.setItem(this.settingsKey, JSON.stringify(resolved));
+    return resolved;
   }
   async exportProviders() { return JSON.stringify(await this.listProviders(), null, 2); }
   async importProviders(payload: string) {

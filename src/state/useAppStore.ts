@@ -165,8 +165,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   async updateSettings(settings) {
     set({ operation: "正在保存设置…", error: undefined });
     try {
-      await backend.saveSettings(settings);
-      set({ settings, operation: undefined });
+      set({ settings: await backend.saveSettings(settings), operation: undefined });
     } catch (error) {
       set({ operation: undefined });
       throw error;

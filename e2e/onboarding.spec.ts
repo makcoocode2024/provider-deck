@@ -279,6 +279,45 @@ test("真实对话失败时展示明确检查结果", async ({ page }, testInfo)
   await expect(page.getByText(/模型不可用或无访问权限/)).toBeVisible();
 });
 
+test("推理档位可以手动切换并在保存后持久化", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await expect(page.getByLabel("手动推理档位")).toHaveValue("high");
+  await page.getByLabel("手动推理档位").selectOption("medium");
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+  await expect(page.getByText("当前生效：中度")).toBeVisible();
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  if (testInfo.project.name === "narrow-chromium") await page.getByRole("button", { name: "打开导航" }).click();
+  await page.getByRole("button", { name: "设置" }).click();
+  await expect(page.getByLabel("手动推理档位")).toHaveValue("medium");
+});
+
+test("开启自动推荐会隐藏手动档位并保留已选档位", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await page.getByLabel("手动推理档位").selectOption("low");
+  await page.getByRole("switch", { name: "自动推荐推理档位" }).click();
+  await expect(page.getByLabel("手动推理档位")).toBeHidden();
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+
+  await page.getByRole("switch", { name: "自动推荐推理档位" }).click();
+  await expect(page.getByLabel("手动推理档位")).toHaveValue("low");
+});
+
+test("修改超时不会重置已保存的推理设置", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await page.getByLabel("手动推理档位").selectOption("low");
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+
+  await page.getByLabel("请求超时（秒）").fill("45");
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+  await expect(page.getByLabel("手动推理档位")).toHaveValue("low");
+  await expect(page.getByText("当前生效：轻度")).toBeVisible();
+});
+
 test("设置保存失败时显示明确反馈", async ({ page }, testInfo) => {
   await page.evaluate(() => localStorage.setItem("provider-deck.e2e.fail-settings-save", "1"));
   await openSettings(page, testInfo);

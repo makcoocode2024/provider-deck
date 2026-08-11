@@ -167,6 +167,8 @@ export interface ChatRestoreResult {
   rollbackSnapshotId?: string;
 }
 
+export type ReasoningLevel = "low" | "medium" | "high";
+
 export interface AppSettings {
   timeoutSeconds: number;
   proxyUrl: string;
@@ -175,6 +177,10 @@ export interface AppSettings {
   clearClipboardSeconds: number;
   locale: "zh-CN" | "en-US";
   localProxyPort?: number;
+  autoReasoningMode: boolean;
+  manualReasoningLevel: ReasoningLevel;
+  effectiveReasoningLevel: ReasoningLevel;
+  reasoningMatchMessage?: string;
 }
 
 export const defaultSettings: AppSettings = {
@@ -185,4 +191,8 @@ export const defaultSettings: AppSettings = {
   clearClipboardSeconds: 30,
   locale: "zh-CN",
   localProxyPort: undefined,
+  autoReasoningMode: false,
+  manualReasoningLevel: "high",
+  effectiveReasoningLevel: "high",
+  reasoningMatchMessage: undefined,
 };

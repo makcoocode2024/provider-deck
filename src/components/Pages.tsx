@@ -1,8 +1,8 @@
 import * as Switch from "@radix-ui/react-switch";
 import * as Dialog from "@radix-ui/react-dialog";
-import { AlertTriangle, Check, CircleX, Clipboard, Download, FileClock, Info, ListRestart, LoaderCircle, MessageCircle, RefreshCw, RotateCcw, Save, ShieldCheck, Upload, X } from "lucide-react";
+import { AlertTriangle, Check, CircleX, Clipboard, Download, FileClock, Gauge, Info, ListRestart, LoaderCircle, MessageCircle, RefreshCw, RotateCcw, Save, ShieldCheck, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { AppSettings, ClientDescriptor, Provider, ProviderTestReport } from "../domain/types";
+import type { AppSettings, ClientDescriptor, Provider, ProviderTestReport, ReasoningLevel } from "../domain/types";
 import { backend } from "../services/backend";
 import { useAppStore } from "../state/useAppStore";
 
@@ -20,6 +20,9 @@ export function BackupsPage() {
   const { backups, restore, operation } = useAppStore();
   return <div className="page-content"><div className="page-heading"><div><h1>备份与恢复</h1><p>每次写入前自动备份，可恢复到任意历史版本。</p></div></div>{backups.length === 0 ? <div className="empty-state"><FileClock size={32} /><h2>还没有备份</h2><p>首次应用配置后，备份记录会显示在这里。</p></div> : <div className="backup-list">{backups.map((backup) => <div className="backup-row" key={backup.id}><FileClock size={20} /><span><strong>{backup.clientId}</strong><small>{backup.targetPath}</small></span><time>{new Date(backup.createdAt).toLocaleString("zh-CN")}</time><button className="button" disabled={Boolean(operation)} onClick={() => restore(backup.id)}><RotateCcw size={16} />恢复</button></div>)}</div>}</div>;
 }
+
+const reasoningLevels: ReasoningLevel[] = ["low", "medium", "high"];
+const reasoningLabels: Record<ReasoningLevel, string> = { low: "轻度", medium: "中度", high: "高" };
 
 export function SettingsPage() {
   const { settings, updateSettings } = useAppStore();
@@ -44,13 +47,14 @@ export function SettingsPage() {
     {saveMessage && <p className={`settings-save-message ${saveState}`} role={saveState === "failed" ? "alert" : "status"}>{saveMessage}</p>}
     <section className="settings-section"><h2>配置写入</h2><SettingSwitch label="只生成配置，不自动写入" description="适合首次试用或无法确认配置格式时。" checked={draft.generateOnly} onCheckedChange={toggle("generateOnly")} /></section>
     <section className="settings-section"><h2>网络</h2><div className="form-grid"><label>请求超时（秒）<input type="number" min={3} max={120} value={draft.timeoutSeconds} onChange={(e) => setDraft({ ...draft, timeoutSeconds: Number(e.target.value) })} /></label><label>代理地址<input value={draft.proxyUrl} placeholder="留空则使用系统设置" onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })} /></label></div><SettingSwitch label="允许自签名证书" description="默认关闭。仅可信内网服务需要启用，并会显示持续警告。" checked={draft.allowSelfSignedCertificates} onCheckedChange={toggle("allowSelfSignedCertificates")} danger /></section>
+    <section className="settings-section"><h2>推理档位</h2><SettingSwitch label="自动推荐推理档位" description="按当前服务的模型参数量、上下文窗口和本机可用显存自动选择，保存时重新计算。" checked={draft.autoReasoningMode} onCheckedChange={toggle("autoReasoningMode")} />{!draft.autoReasoningMode && <label>手动推理档位<select aria-label="手动推理档位" value={draft.manualReasoningLevel} onChange={(event) => setDraft({ ...draft, manualReasoningLevel: event.target.value as ReasoningLevel })}>{reasoningLevels.map((level) => <option value={level} key={level}>{reasoningLabels[level]}</option>)}</select></label>}<div className="setting-row"><span><Gauge size={17} /><span><strong>当前生效：{reasoningLabels[draft.effectiveReasoningLevel]}</strong><small>{draft.reasoningMatchMessage ?? "Codex 配置的 model_reasoning_effort 和本地代理都使用该档位。"}</small></span></span></div></section>
     <section className="settings-section"><h2>Codex 本地兼容桥</h2><div className="setting-row"><span><ShieldCheck size={17} /><span><strong>{draft.localProxyPort ? `运行中 · 127.0.0.1:${draft.localProxyPort}` : "桌面版启动后可用"}</strong><small>仅监听本机环回地址。使用 Chat-only 服务时，请保持 Provider Deck 运行。</small></span></span></div></section>
     <section className="settings-section"><h2>剪贴板</h2><label>复制密钥后自动清除（秒）<input type="number" min={0} max={300} value={draft.clearClipboardSeconds} onChange={(e) => setDraft({ ...draft, clearClipboardSeconds: Number(e.target.value) })} /></label></section>
   </div>;
 }
 
 function SettingSwitch({ label, description, checked, onCheckedChange, danger }: { label: string; description: string; checked: boolean; onCheckedChange(value: boolean): void; danger?: boolean }) {
-  return <div className="setting-row"><span>{danger && <AlertTriangle size={17} />}<span><strong>{label}</strong><small>{description}</small></span></span><Switch.Root className="switch" checked={checked} onCheckedChange={onCheckedChange}><Switch.Thumb className="switch-thumb" /></Switch.Root></div>;
+  return <div className="setting-row"><span>{danger && <AlertTriangle size={17} />}<span><strong>{label}</strong><small>{description}</small></span></span><Switch.Root className="switch" aria-label={label} checked={checked} onCheckedChange={onCheckedChange}><Switch.Thumb className="switch-thumb" /></Switch.Root></div>;
 }
 
 export function DiagnosticsPage() {
