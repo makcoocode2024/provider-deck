@@ -14,6 +14,7 @@ mod reasoning_capability;
 mod reasoning_adapters;
 mod reasoning_discovery;
 mod reasoning_selection;
+mod reasoning_verification;
 mod storage;
 
 use std::collections::HashMap;
