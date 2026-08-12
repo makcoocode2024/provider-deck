@@ -15,8 +15,12 @@ import type {
   ProviderDraft,
   ProviderTestReport,
   ReasoningCapability,
+  ReasoningTier,
+  RuntimeVerification,
+  VerificationResult,
 } from "../domain/types";
 import { defaultSettings } from "../domain/types";
+import { appendVerification } from "../domain/reasoning";
 import { normalizeBaseUrl } from "../domain/url";
 
 /**
@@ -95,6 +99,16 @@ export interface AppBackend {
   refreshProviderModels(id: string): Promise<Provider>;
   /** 单模型级重新探测推理能力。绕过 TTL，只影响该模型。 */
   reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider>;
+  /**
+   * 运行时验证某个档位是否真的生效。**会发出一次真实计费请求。**
+   *
+   * 只收 tier：binding 由后端从能力表派生（`reasoning_verification.rs:82`），
+   * 前端不许自带绑定，否则验证的就不是"能力表声明的那套参数"了。
+   *
+   * 返回单条记录而非整个 Provider，追加由 store 完成——后端 command 的契约在 Phase C
+   * 已定稳，不为前端 state shape 改它。
+   */
+  verifyModelReasoning(providerId: string, modelId: string, tier: ReasoningTier): Promise<RuntimeVerification>;
   testProvider(providerId: string, modelId?: string): Promise<ProviderTestReport>;
   detectClients(): Promise<ClientDescriptor[]>;
   previewChanges(providerId: string, clientIds: string[]): Promise<ConfigChange[]>;
@@ -127,6 +141,10 @@ class TauriBackend implements AppBackend {
   reprobeProvider = (id: string) => invoke<Provider>("reprobe_provider", { id });
   refreshProviderModels = (id: string) => invoke<Provider>("refresh_provider_models", { providerId: id });
   reprobeModelReasoning = (providerId: string, modelId: string) => invoke<Provider>("reprobe_model_reasoning", { providerId, modelId });
+  // 参数名保持 camelCase：Tauri 2 按 camelCase → snake_case 匹配 command 形参，
+  // 写成 provider_id 会导致 invoke 报参数缺失。
+  verifyModelReasoning = (providerId: string, modelId: string, tier: ReasoningTier) =>
+    invoke<RuntimeVerification>("verify_model_reasoning", { providerId, modelId, tier });
   testProvider = (providerId: string, modelId?: string) => invoke<ProviderTestReport>("test_provider", { providerId, modelId });
   detectClients = () => invoke<ClientDescriptor[]>("detect_clients");
   previewChanges = (providerId: string, clientIds: string[]) =>
@@ -294,6 +312,51 @@ class BrowserBackend implements AppBackend {
     };
     localStorage.setItem(this.providerKey, JSON.stringify(providers.map((item) => item.id === providerId ? refreshed : item)));
     return refreshed;
+  }
+
+  /**
+   * 模拟一次运行时验证。三态由 localStorage 开关决定，默认 confirmed。
+   *
+   * 与真实后端一致的三点：binding 从能力表按 tier 派生（不接受调用方自带）、
+   * 三态一律追加进 `reasoningVerifications`、返回单条记录而不是整个 Provider。
+   * 文案也照抄后端 `reasoning_verification.rs` 的格式，好让 UI 断言在两套后端下等价。
+   */
+  async verifyModelReasoning(providerId: string, modelId: string, tier: ReasoningTier): Promise<RuntimeVerification> {
+    this.ensureTestMode();
+    const providers = await this.listProviders();
+    const provider = providers.find((item) => item.id === providerId);
+    if (!provider) throw new Error(`未找到服务：${providerId}`);
+    const model = provider.models.find((item) => item.id === modelId);
+    if (!model) throw new Error(`模型 ${modelId} 不属于该服务`);
+    const capability = model.reasoning;
+    if (!capability) throw new Error("该模型尚未探明推理能力，无法验证");
+    const option = capability.tiers.find((item) => item.tier === tier);
+    if (!option) throw new Error(`Tier ${tier} 在该 capability 中不存在`);
+
+    const protocol = model.protocol;
+    const forced = localStorage.getItem("provider-deck.e2e.verify-result");
+    const result: VerificationResult =
+      forced === "rejected" ? { status: "rejected", reason: `响应中未检测到 ${protocol} 协议的推理字段` }
+      : forced === "failed" ? { status: "failed", error: "API 错误 429：测试后端模拟请求失败" }
+      : { status: "confirmed" };
+
+    const verification: RuntimeVerification = {
+      modelId,
+      baseUrl: provider.baseUrl,
+      tier,
+      binding: option.binding,
+      result,
+      verifiedAt: new Date().toISOString(),
+      protocol,
+    };
+    // 真实后端在 Rust 侧入库，测试后端在这里入库：三态都留痕，且不触碰 model.reasoning。
+    // 追加规则复用 domain 层的那一份，避免同一条规则在 TypeScript 里存在第二个实现。
+    const stored: Provider = {
+      ...provider,
+      reasoningVerifications: appendVerification(provider.reasoningVerifications, verification),
+    };
+    localStorage.setItem(this.providerKey, JSON.stringify(providers.map((item) => item.id === providerId ? stored : item)));
+    return verification;
   }
 
   async testProvider(providerId: string, modelId?: string): Promise<ProviderTestReport> {

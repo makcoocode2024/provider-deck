@@ -8,8 +8,11 @@ import type {
   ProbeResult,
   Provider,
   ProviderDraft,
+  ReasoningTier,
+  RuntimeVerification,
 } from "../domain/types";
 import { defaultSettings } from "../domain/types";
+import { appendVerification } from "../domain/reasoning";
 import { backend } from "../services/backend";
 
 interface AppState {
@@ -28,6 +31,7 @@ interface AppState {
   reprobeProvider(id: string): Promise<void>;
   refreshProviderModels(id: string): Promise<Provider>;
   reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider>;
+  verifyModelReasoning(providerId: string, modelId: string, tier: ReasoningTier): Promise<RuntimeVerification>;
   testProvider(id: string, modelId?: string): Promise<import("../domain/types").ProviderTestReport>;
   saveProvider(draft: ProviderDraft): Promise<Provider>;
   deleteProvider(id: string): Promise<void>;
@@ -131,6 +135,32 @@ export const useAppStore = create<AppState>((set, get) => ({
         operation: undefined,
       });
       return refreshed;
+    } catch (error) {
+      set({ operation: undefined, error: messageOf(error) });
+      throw error;
+    }
+  },
+
+  /**
+   * 运行时验证。本 action 只做编排：调 backend、调 {@link appendVerification}、换掉那一个
+   * provider、收尾 operation/error。追加规则本身在 domain 层，store 和组件都不复刻它。
+   *
+   * 只写 `provider.reasoningVerifications` 一个字段。**不碰** `models`——也就不碰
+   * `model.reasoning` 的 confidence / evidence：能力发现与运行时验证是两条并行链路，
+   * 一次 Confirmed 不构成探测事实，绝不抬升 confidence 到 verified。
+   */
+  async verifyModelReasoning(providerId, modelId, tier) {
+    set({ operation: "正在向该端点发送一次真实请求以验证推理档位…", error: undefined });
+    try {
+      const verification = await backend.verifyModelReasoning(providerId, modelId, tier);
+      set({
+        providers: get().providers.map((provider) => provider.id === providerId
+          ? { ...provider, reasoningVerifications: appendVerification(provider.reasoningVerifications, verification) }
+          : provider),
+        operation: undefined,
+      });
+      // 三态都返回给调用方：Rejected/Failed 是验证结果，不是异常，组件按 result.status 分支。
+      return verification;
     } catch (error) {
       set({ operation: undefined, error: messageOf(error) });
       throw error;
