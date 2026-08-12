@@ -271,14 +271,14 @@ Rejected 是有效的负事实，Failed 是排障线索，隐藏任何一个都�
   ↓
 ProviderWizard.tsx          onVerify handler；新建流程没有 provider id，不传 onVerify，整个验证区不渲染
   ↓
-useAppStore.ts              verifyReasoning action；唯一允许追加 verification 的地方
+useAppStore.ts              verifyReasoning action；前端唯一允许追加 verification 的地方
   ↓
 backend.ts                  AppBackend.verifyModelReasoning({ providerId, modelId, tier })，参数 camelCase
   ↓
 Rust command                verify_model_reasoning → reasoning_verification.rs 发一次真实请求并判定
 BrowserBackend mock         localStorage 后端，按 provider-deck.e2e.verify-result 决定三态
   ↓
-reasoningVerifications      appendVerification：old history + new record，追加不覆盖
+reasoningVerifications      追加入库：Rust 走 lib.rs:441，前端走 appendVerification，两端都是 append-only
   ↓
 UI history                  ReasoningTierPicker 读 savedProvider.reasoningVerifications 渲染徽章与历史列表
 ~~~
@@ -287,8 +287,14 @@ UI history                  ReasoningTierPicker 读 savedProvider.reasoningVerif
 
 1. **invoke 参数必须 camelCase**。Tauri 2 按 camelCase → snake_case 匹配 command 形参，写
    `provider_id` / `model_id` 会直接报参数缺失。
-2. **追加语义只实现一次**。`appendVerification` 在 `src/domain/reasoning.ts`，store 层和组件层都不重复实现，
-   也不允许组件层直接改 `reasoningVerifications`。
+2. **追加语义在两端各实现一次，但都必须是 append-only**。追加逻辑有两处独立实现：
+   - Rust command 层：`lib.rs:441` 的 `saved.reasoning_verifications.entry(model_id).or_default().push(verification)`
+   - 前端 domain 层：`src/domain/reasoning.ts` 的 `appendVerification()`，被 `useAppStore` 与 `BrowserBackend` 调用
+
+   两者不共享代码，但语义必须保持一致：**old history + new record，绝不覆盖已有 verification history**。
+   在各自那一端内部不再重复实现 —— store 层和组件层都不自己拼数组，也不允许组件层直接改
+   `reasoningVerifications`；Rust 侧除 `lib.rs:441` 外没有第二个写入点。
+   改动任何一端时都要同步检查另一端，否则 Vitest/Playwright 会绿而生产行为不同。
 3. **UI 读 store 而不是 initial 快照**。`ProviderWizard.tsx:142-144` 从 `useAppStore` 取
    `savedProvider`，因为 `initial` 是打开向导那一刻的快照，读它看不到刚追加的记录。
    同一处 capability 仍走 `probeResult`（`:379` 的 `capability={activeModel?.reasoning}` 与 `:384` 的
@@ -328,7 +334,7 @@ bfc0c4b…e01db13 五个 commit 提供。下表是 Phase D 的前端改动，全
 | --- | --- |
 | `src/services/backend.ts` | +63：`AppBackend.verifyModelReasoning` 接口、`TauriBackend` invoke 实现、`BrowserBackend` mock（`:324-360`） |
 | `src/services/backend.test.ts` | +152/-1：invoke 参数 camelCase、mock 三态、入库形状 |
-| `src/state/useAppStore.ts` | +30：`verifyReasoning` action，唯一的追加入口 |
+| `src/state/useAppStore.ts` | +30：`verifyReasoning` action，前端唯一的追加入口（Rust 侧的入口是 `lib.rs:441`） |
 | `src/state/useAppStore.test.ts` | +175/-3：追加不覆盖、失败不擦除历史、confidence/evidence 不被触碰 |
 
 **D3 UI（576 insertions, 6 deletions）**
@@ -400,7 +406,8 @@ bfc0c4b…e01db13 五个 commit 提供。下表是 Phase D 的前端改动，全
 3. verification 结果 → `ModelInfo.reasoning`（任何字段）。
 4. 用 verification history 替代或覆盖 discovery 结果。
 5. 把 capability 与 verification history 合并成一个数据结构或一次查询。
-6. `history = [verification]`（覆盖式写入）；只能 `old + new`。
+6. `history = [verification]`（覆盖式写入）；只能 `old + new`。这条对两端同时生效 ——
+   Rust 的 `lib.rs:441` 与前端的 `appendVerification()` 是两处独立实现，任一处退化成覆盖式都算违反。
 7. 为了让测试通过而改生产逻辑、改 `src-tauri/**`、改 Runtime Verification 数据模型。
 
 
