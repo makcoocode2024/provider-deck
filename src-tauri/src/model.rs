@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::reasoning_capability::ReasoningCapability;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProtocolKind {
@@ -53,6 +55,8 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub parameter_count_billions: Option<f64>,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningCapability>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +147,10 @@ pub struct ProbeResult {
     pub checked_endpoints: Vec<String>,
     pub user_message: String,
     pub technical_detail: Option<String>,
+    /// 推理能力发现的说明（限流、端点不可达、需要真实请求才能确证等）。
+    /// 与 codexProbeDetail 同级，供前端展示；能力本体挂在 ModelInfo.reasoning 上。
+    #[serde(default)]
+    pub reasoning_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

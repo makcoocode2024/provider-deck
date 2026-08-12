@@ -160,7 +160,7 @@ mod tests {
         let model = ModelInfo {
             id: "coder-70b".into(), display_name: "Coder 70B".into(), provider: None,
             protocol: ProtocolKind::Openai, source: "server".into(), capabilities: vec![],
-            context_window: Some(128_000), parameter_count_billions: None,
+            context_window: Some(128_000), parameter_count_billions: None, reasoning: None,
         };
         assert_eq!(recommend(&provider(model, "https://api.example.com/v1")).level, ReasoningLevel::High);
     }
@@ -170,7 +170,7 @@ mod tests {
         let model = ModelInfo {
             id: "mini-3b".into(), display_name: "Mini 3B".into(), provider: None,
             protocol: ProtocolKind::Openai, source: "server".into(), capabilities: vec![],
-            context_window: Some(32_000), parameter_count_billions: Some(3.0),
+            context_window: Some(32_000), parameter_count_billions: Some(3.0), reasoning: None,
         };
         assert_eq!(recommend(&provider(model, "http://127.0.0.1:11434/v1")).level, ReasoningLevel::Low);
     }

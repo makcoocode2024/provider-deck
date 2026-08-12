@@ -10,6 +10,9 @@ mod responses_chat;
 mod protocol;
 mod redaction;
 mod reasoning;
+mod reasoning_capability;
+mod reasoning_adapters;
+mod reasoning_discovery;
 mod storage;
 
 use std::collections::HashMap;
@@ -55,6 +58,10 @@ async fn save_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy
     }
     credentials::set(&id, &resolved_draft.api_key)?;
     let settings = store.read().settings;
+    // 回灌已存的推理能力，作为发现流程的缓存输入：未过期就不会再发请求。
+    if let Some(stored) = store.read().providers.iter().find(|provider| provider.id == id) {
+        carry_reasoning_forward(&mut probe.models, &stored.models);
+    }
     protocol::refresh_selected_capabilities(&resolved_draft, &settings, &mut probe).await;
     let provider = store.update(|state| {
         let existing = state.providers.iter().find(|provider| provider.id == id).cloned();
@@ -151,7 +158,9 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
                         .ok_or_else(|| AppError::ProviderNotFound(id.clone()))?;
                     saved.base_url = probe.normalized_base_url;
                     saved.protocol = probe.protocol;
-                    saved.models = probe.models;
+                    let mut models = probe.models;
+                    carry_reasoning_forward(&mut models, &saved.models);
+                    saved.models = models;
                     saved.codex_compatibility = probe.codex_compatibility;
                     saved.codex_probe_model = probe.codex_probe_model;
                     saved.codex_probe_detail = probe.codex_probe_detail;
@@ -190,6 +199,23 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
     }
 }
 
+/// 把已发现的推理能力从旧模型列表迁移到新模型列表。
+///
+/// 刷新模型（reprobe / refresh_provider_models / save_provider）都是整体替换 models，
+/// 不迁移的话每次刷新都会清空能力缓存：Unknown 的 6 小时退避窗口归零，用户点一次
+/// "获取模型"就会在下次保存时重发一轮 Tier 2 探测。
+///
+/// 能力归属 (base_url, model_id)，换了 base_url 的旧能力会被编排器按 key 拒绝，
+/// 所以这里只按 model_id 对齐即可，不需要额外校验。
+fn carry_reasoning_forward(fresh: &mut [model::ModelInfo], previous: &[model::ModelInfo]) {
+    for model in fresh.iter_mut() {
+        if model.reasoning.is_some() { continue; }
+        if let Some(existing) = previous.iter().find(|item| item.id == model.id) {
+            model.reasoning = existing.reasoning.clone();
+        }
+    }
+}
+
 fn provider_draft(provider: &Provider, api_key: String, settings: &AppSettings) -> ProviderDraft {
     ProviderDraft {
         id: Some(provider.id.clone()),
@@ -219,6 +245,8 @@ async fn refresh_provider_models(store: State<'_, StateStore>, provider_id: Stri
             let refreshed = {
                 let saved = state.providers.iter_mut().find(|item| item.id == provider_id)
                     .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+                let mut models = models;
+                carry_reasoning_forward(&mut models, &saved.models);
                 saved.models = models;
                 saved.default_model = saved.default_model.clone()
                     .filter(|model| saved.models.iter().any(|item| &item.id == model))
@@ -447,4 +475,63 @@ pub fn run() {
         list_chat_backups, chat_cache_summary, export_chat_backup, restore_chat_backup_file, restore_chat_backup_payload, restore_chat_cache, rollback_chat_restore,
         export_providers, import_providers, diagnostics
     ]).run(tauri::generate_context!()).expect("error while running Provider Deck");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reasoning_capability::{ReasoningCapability, ReasoningConfidence, ReasoningKey};
+
+    fn model(id: &str, reasoning: Option<ReasoningCapability>) -> model::ModelInfo {
+        model::ModelInfo {
+            id: id.into(),
+            display_name: id.into(),
+            provider: None,
+            protocol: model::ProtocolKind::Openai,
+            source: "test".into(),
+            capabilities: Vec::new(),
+            context_window: None,
+            parameter_count_billions: None,
+            reasoning,
+        }
+    }
+
+    fn capability(base_url: &str, model_id: &str) -> ReasoningCapability {
+        ReasoningCapability::from_effort_enum(
+            ReasoningKey::new(base_url, model_id),
+            &["low".into(), "high".into()],
+            ReasoningConfidence::Declared,
+        )
+    }
+
+    /// 要求 5：刷新 / 重新检测模型不能丢掉已发现的推理能力。
+    /// 丢了的话 Unknown 的 6 小时退避窗口会归零，用户每次"获取模型"都会触发重探。
+    #[test]
+    fn refresh_carries_reasoning_forward() {
+        let previous = vec![
+            model("gpt-x", Some(capability("https://api.example.com/v1", "gpt-x"))),
+            model("gpt-y", Some(capability("https://api.example.com/v1", "gpt-y"))),
+        ];
+        // 刷新拿到的新列表：能力字段一律为空，且模型集合有增有减。
+        let mut fresh = vec![model("gpt-x", None), model("gpt-z", None)];
+
+        carry_reasoning_forward(&mut fresh, &previous);
+
+        assert!(fresh[0].reasoning.is_some(), "已发现的能力在刷新后丢失");
+        assert_eq!(fresh[0].reasoning.as_ref().unwrap().tiers.len(), 2);
+        assert!(fresh[1].reasoning.is_none(), "新模型不应继承其他模型的能力");
+    }
+
+    /// 探测本轮已产出的能力优先，不被旧缓存覆盖。
+    #[test]
+    fn fresh_reasoning_wins_over_previous() {
+        let previous = vec![model("gpt-x", Some(capability("https://api.example.com/v1", "gpt-x")))];
+        let mut discovered = capability("https://api.example.com/v1", "gpt-x");
+        discovered.confidence = ReasoningConfidence::Validated;
+        let mut fresh = vec![model("gpt-x", Some(discovered))];
+
+        carry_reasoning_forward(&mut fresh, &previous);
+
+        assert_eq!(fresh[0].reasoning.as_ref().unwrap().confidence, ReasoningConfidence::Validated);
+    }
 }

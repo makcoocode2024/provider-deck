@@ -92,6 +92,7 @@ fn codex_catalog(provider: &Provider, settings: &AppSettings) -> AppResult<Strin
                 capabilities: Vec::new(),
                 context_window: None,
                 parameter_count_billions: None,
+                reasoning: None,
             });
         }
     }
@@ -487,7 +488,7 @@ mod tests {
         custom.default_model = Some("third-party-coding-model".into());
         custom.claude_model_profile = Some(ClaudeModelProfile::Opus);
         custom.claude_extended_context = true;
-        custom.models = vec![crate::model::ModelInfo { id: "third-party-coding-model".into(), display_name: "Third Party Coding Model".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: Some(1_000_000), parameter_count_billions: None }];
+        custom.models = vec![crate::model::ModelInfo { id: "third-party-coding-model".into(), display_name: "Third Party Coding Model".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: Some(1_000_000), parameter_count_billions: None, reasoning: None }];
         let output = merge_claude("{}", &custom, "secret").unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["model"], "opus");
@@ -505,8 +506,8 @@ mod tests {
         custom.claude_model_profile = Some(ClaudeModelProfile::Sonnet);
         custom.claude_model_mappings = ClaudeModelMappings { sonnet: Some("agnes-2.0-flash".into()), opus: Some("deep-coder".into()), haiku: None };
         custom.models = vec![
-            crate::model::ModelInfo { id: "agnes-2.0-flash".into(), display_name: "Agnes Flash".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None, parameter_count_billions: None },
-            crate::model::ModelInfo { id: "deep-coder".into(), display_name: "Deep Coder".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None, parameter_count_billions: None },
+            crate::model::ModelInfo { id: "agnes-2.0-flash".into(), display_name: "Agnes Flash".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None, parameter_count_billions: None, reasoning: None },
+            crate::model::ModelInfo { id: "deep-coder".into(), display_name: "Deep Coder".into(), provider: None, protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: vec![], context_window: None, parameter_count_billions: None, reasoning: None },
         ];
         let output = merge_claude(r#"{"env":{"ANTHROPIC_MODEL":"agnes-2.0-flash","ANTHROPIC_DEFAULT_HAIKU_MODEL":"old-model","ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME":"Old","ANTHROPIC_DEFAULT_FABLE_MODEL":"claude-fable-5","ANTHROPIC_CUSTOM_MODEL_OPTION":"old-custom","CLAUDE_CODE_SUBAGENT_MODEL":"old-subagent"}}"#, &custom, "secret").unwrap();
         let value: Value = serde_json::from_str(&output).unwrap();

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 use reqwest::{header::{AUTHORIZATION, CONTENT_TYPE}, Client, StatusCode};
 use serde_json::{json, Value};
 use url::Url;
-use crate::{error::{AppError, AppResult}, model::{AppSettings, CodexCompatibility, ModelInfo, ProbeResult, ProtocolKind, ProviderDraft, ProviderTestCheck, ProviderTestReport}, redaction::redact};
+use crate::{error::{AppError, AppResult}, model::{AppSettings, CodexCompatibility, ModelInfo, ProbeResult, ProtocolKind, ProviderDraft, ProviderTestCheck, ProviderTestReport}, reasoning_discovery, redaction::redact};
 
 pub fn normalize_base_url(input: &str) -> AppResult<String> {
     let trimmed = input.trim();
@@ -215,6 +215,7 @@ pub async fn probe(draft: &ProviderDraft, settings: &AppSettings) -> AppResult<P
             checked_endpoints: Vec::new(),
             user_message: "已识别 Azure OpenAI。部署名称无法从低权限公共接口可靠枚举，请手动填写模型部署名。".into(),
             technical_detail: None,
+            reasoning_note: None,
         });
     }
     let client = build_client(settings, draft.timeout_seconds)?;
@@ -248,12 +249,13 @@ pub async fn probe(draft: &ProviderDraft, settings: &AppSettings) -> AppResult<P
                     checked_endpoints: checked,
                     user_message: "模型列表读取成功。".into(),
                     technical_detail: None,
+                    reasoning_note: None,
                 };
                 if is_openai {
                     refresh_selected_capabilities(draft, settings, &mut probe).await;
                     probe.user_message = codex_probe_message(&probe.codex_compatibility);
                 } else {
-                    if matches!(probe.protocol, ProtocolKind::Anthropic) {
+                    if matches!(probe.protocol, ProtocolKind::Anthropic | ProtocolKind::Gemini) {
                         refresh_selected_capabilities(draft, settings, &mut probe).await;
                     }
                     probe.user_message = "模型列表读取成功，未发起模型生成请求。".into();
@@ -279,37 +281,50 @@ fn push_checked(probe: &mut ProbeResult, target: String) {
 }
 
 pub async fn refresh_selected_capabilities(draft: &ProviderDraft, settings: &AppSettings, probe: &mut ProbeResult) {
-    if !matches!(probe.protocol, ProtocolKind::Openai | ProtocolKind::Anthropic) { return; }
+    if !matches!(probe.protocol, ProtocolKind::Openai | ProtocolKind::Anthropic | ProtocolKind::Gemini) { return; }
     let selected = draft.default_model.as_ref()
         .filter(|model| probe.models.iter().any(|item| &item.id == *model))
         .cloned()
         .or_else(|| probe.models.first().map(|model| model.id.clone()));
     let Some(model) = selected else {
-        probe.codex_compatibility = CodexCompatibility::Unknown;
-        probe.codex_probe_detail = Some("模型列表为空，无法执行 Codex 兼容性探测。".into());
+        // Gemini 从未参与 Codex 探测，不能因为放开 discovery 门禁就改写它的兼容性结论。
+        if !matches!(probe.protocol, ProtocolKind::Gemini) {
+            probe.codex_compatibility = CodexCompatibility::Unknown;
+            probe.codex_probe_detail = Some("模型列表为空，无法执行 Codex 兼容性探测。".into());
+        }
         return;
     };
     let Ok(client) = build_client(settings, draft.timeout_seconds) else {
-        probe.codex_compatibility = CodexCompatibility::Unknown;
-        probe.codex_probe_detail = Some("无法创建安全网络客户端，已采用函数工具保守模式。".into());
+        if !matches!(probe.protocol, ProtocolKind::Gemini) {
+            probe.codex_compatibility = CodexCompatibility::Unknown;
+            probe.codex_probe_detail = Some("无法创建安全网络客户端，已采用函数工具保守模式。".into());
+        }
         return;
     };
 
-    if probe.models.iter().find(|item| item.id == model).and_then(|item| item.context_window).is_none() {
-        if let Ok(target) = model_detail_endpoint(&probe.normalized_base_url, &model) {
-            push_checked(probe, target.clone());
-            let request = client.get(&target);
-            let request = if matches!(probe.protocol, ProtocolKind::Anthropic) {
-                request.header("x-api-key", &draft.api_key).header("anthropic-version", "2023-06-01")
-            } else {
-                request.header(AUTHORIZATION, format!("Bearer {}", draft.api_key))
-            };
-            if let Ok(response) = request.send().await {
-                if response.status().is_success() {
-                    if let Ok(body) = response.json::<Value>().await {
-                        let detected = context_window(&body).or_else(|| body.get("data").and_then(context_window));
-                        if let Some(model_info) = probe.models.iter_mut().find(|item| item.id == model) {
-                            if detected.is_some() { model_info.context_window = detected; }
+    // 步骤 2：context_window 补齐。行为与改造前完全一致，只是把已取到的响应体留给
+    // 步骤 4 的 Tier 0 复用。Gemini 不进入本段——它此前也从未进入。
+    let mut model_detail: Option<Value> = None;
+    let mut detail_target: Option<String> = None;
+    if matches!(probe.protocol, ProtocolKind::Openai | ProtocolKind::Anthropic) {
+        if probe.models.iter().find(|item| item.id == model).and_then(|item| item.context_window).is_none() {
+            if let Ok(target) = model_detail_endpoint(&probe.normalized_base_url, &model) {
+                push_checked(probe, target.clone());
+                detail_target = Some(target.clone());
+                let request = client.get(&target);
+                let request = if matches!(probe.protocol, ProtocolKind::Anthropic) {
+                    request.header("x-api-key", &draft.api_key).header("anthropic-version", "2023-06-01")
+                } else {
+                    request.header(AUTHORIZATION, format!("Bearer {}", draft.api_key))
+                };
+                if let Ok(response) = request.send().await {
+                    if response.status().is_success() {
+                        if let Ok(body) = response.json::<Value>().await {
+                            let detected = context_window(&body).or_else(|| body.get("data").and_then(context_window));
+                            if let Some(model_info) = probe.models.iter_mut().find(|item| item.id == model) {
+                                if detected.is_some() { model_info.context_window = detected; }
+                            }
+                            model_detail = Some(body);
                         }
                     }
                 }
@@ -317,8 +332,17 @@ pub async fn refresh_selected_capabilities(draft: &ProviderDraft, settings: &App
         }
     }
 
+    // 步骤 3：Codex 兼容性探测。原样保留，仅抽成函数以便步骤 4 不被提前 return 跳过。
+    run_codex_probe(draft, probe, &client, &model).await;
+
+    // 步骤 4（新增）：推理能力发现。
+    discover_model_reasoning(draft, probe, &client, &model, model_detail.as_ref(), detail_target.as_deref()).await;
+}
+
+/// Codex 兼容性探测。内容与改造前的行内实现逐行一致。
+async fn run_codex_probe(draft: &ProviderDraft, probe: &mut ProbeResult, client: &Client, model: &str) {
     if !matches!(probe.protocol, ProtocolKind::Openai) { return; }
-    if probe.codex_probe_model.as_deref() == Some(model.as_str()) { return; }
+    if probe.codex_probe_model.as_deref() == Some(model) { return; }
     let target = match endpoint(&probe.normalized_base_url, "responses", "/v1") {
         Ok(target) => target,
         Err(error) => {
@@ -328,18 +352,67 @@ pub async fn refresh_selected_capabilities(draft: &ProviderDraft, settings: &App
         }
     };
     push_checked(probe, target.clone());
-    let (mut compatibility, mut detail) = probe_responses_tools(&client, &target, &draft.api_key, &model).await;
+    let (mut compatibility, mut detail) = probe_responses_tools(client, &target, &draft.api_key, model).await;
     if matches!(compatibility, CodexCompatibility::ResponsesUnsupported) {
         if let Ok(chat_target) = endpoint(&probe.normalized_base_url, "chat/completions", "/v1") {
             push_checked(probe, chat_target.clone());
-            let (chat_supported, chat_detail) = probe_chat_tools(&client, &chat_target, &draft.api_key, &model).await;
+            let (chat_supported, chat_detail) = probe_chat_tools(client, &chat_target, &draft.api_key, model).await;
             detail = format!("{detail} {chat_detail}");
             if chat_supported { compatibility = CodexCompatibility::ChatProxy; }
         }
     }
     probe.codex_compatibility = compatibility;
-    probe.codex_probe_model = Some(model);
+    probe.codex_probe_model = Some(model.to_owned());
     probe.codex_probe_detail = Some(redact(&detail, &[&draft.api_key]));
+}
+
+/// 推理能力发现。整段不产生任何 Err：编排器签名就不返回 Result，
+/// 因此本函数无论遇到什么都只会写 note/evidence，绝不会阻塞 save_provider。
+async fn discover_model_reasoning(
+    draft: &ProviderDraft,
+    probe: &mut ProbeResult,
+    client: &Client,
+    model: &str,
+    model_detail: Option<&Value>,
+    detail_target: Option<&str>,
+) {
+    if !reasoning_discovery::supports_discovery(probe.protocol) { return; }
+
+    // Tier 0 数据来源：优先复用 context_window 那一次请求的响应体。
+    // 是否可复用由端点比对决定，不在此处判断协议。
+    let reusable = detail_target.is_some_and(|target| {
+        reasoning_discovery::metadata_endpoint_matches(&probe.normalized_base_url, probe.protocol, model, target)
+    });
+    let metadata = match (reusable, model_detail) {
+        (true, Some(body)) => reasoning_discovery::MetadataSource::Provided(body),
+        // 同一端点已试过且失败，不重复消耗请求。
+        (true, None) => reasoning_discovery::MetadataSource::Attempted,
+        _ => reasoning_discovery::MetadataSource::Absent,
+    };
+
+    // 缓存输入：能力挂在 ModelInfo 上，键是 (base_url, model_id)。
+    let cached = probe.models.iter().find(|item| item.id == model).and_then(|item| item.reasoning.clone());
+
+    let outcome = reasoning_discovery::discover_reasoning_capability(
+        client,
+        probe.protocol,
+        &probe.normalized_base_url,
+        model,
+        &draft.api_key,
+        metadata,
+        cached.as_ref(),
+    )
+    .await;
+
+    for target in outcome.checked_endpoints { push_checked(probe, target); }
+    if outcome.changed {
+        if let Some(model_info) = probe.models.iter_mut().find(|item| item.id == model) {
+            model_info.reasoning = Some(outcome.capability);
+        }
+    }
+    if let Some(note) = outcome.note {
+        probe.reasoning_note = Some(redact(&note, &[&draft.api_key]));
+    }
 }
 
 async fn send_tool_probe(client: &Client, target: &str, key: &str, model: &str, tool: Value) -> Result<(StatusCode, String), String> {
@@ -455,7 +528,7 @@ async fn probe_openai(client: &Client, base: &str, key: &str) -> Result<(String,
     let body: Value = response.json().await.map_err(|e| (target.clone(), format!("响应不是有效 JSON：{e}")))?;
     if !status.is_success() { return Err((target, classify_status(status, &body))); }
     let data = body.get("data").and_then(Value::as_array).ok_or_else(|| (target.clone(), "响应缺少 data 模型数组".into()))?;
-    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: item.get("owned_by").and_then(Value::as_str).map(str::to_owned), protocol: ProtocolKind::Openai, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item) })).collect();
+    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: item.get("owned_by").and_then(Value::as_str).map(str::to_owned), protocol: ProtocolKind::Openai, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item), reasoning: None })).collect();
     let confidence = if headers.contains_key("openai-version") || body.get("object").and_then(Value::as_str) == Some("list") { 0.98 } else { 0.88 };
     Ok((target, models, confidence))
 }
@@ -468,7 +541,7 @@ async fn probe_anthropic(client: &Client, base: &str, key: &str) -> Result<(Stri
     let body: Value = response.json().await.map_err(|e| (target.clone(), format!("响应不是有效 JSON：{e}")))?;
     if !status.is_success() { return Err((target, classify_status(status, &body))); }
     let data = body.get("data").and_then(Value::as_array).ok_or_else(|| (target.clone(), "响应缺少 data 模型数组".into()))?;
-    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Anthropic-compatible".into()), protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item) })).collect();
+    let models = data.iter().filter_map(|item| item.get("id")?.as_str().map(|id| ModelInfo { id: id.into(), display_name: item.get("display_name").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Anthropic-compatible".into()), protocol: ProtocolKind::Anthropic, source: "server".into(), capabilities: Vec::new(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item), reasoning: None })).collect();
     let confidence = if headers.keys().any(|name| name.as_str().starts_with("anthropic-")) || data.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("model")) { 0.98 } else { 0.86 };
     Ok((target, models, confidence))
 }
@@ -480,7 +553,7 @@ async fn probe_gemini(client: &Client, base: &str, key: &str) -> Result<(String,
     let body: Value = response.json().await.map_err(|e| (target.clone(), format!("响应不是有效 JSON：{e}")))?;
     if !status.is_success() { return Err((target, classify_status(status, &body))); }
     let data = body.get("models").and_then(Value::as_array).ok_or_else(|| (target.clone(), "响应缺少 models 数组".into()))?;
-    let models = data.iter().filter_map(|item| item.get("name")?.as_str().map(|name| { let id = name.strip_prefix("models/").unwrap_or(name); ModelInfo { id: id.into(), display_name: item.get("displayName").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Gemini-compatible".into()), protocol: ProtocolKind::Gemini, source: "server".into(), capabilities: item.get("supportedGenerationMethods").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item) } })).collect();
+    let models = data.iter().filter_map(|item| item.get("name")?.as_str().map(|name| { let id = name.strip_prefix("models/").unwrap_or(name); ModelInfo { id: id.into(), display_name: item.get("displayName").and_then(Value::as_str).unwrap_or(id).into(), provider: Some("Gemini-compatible".into()), protocol: ProtocolKind::Gemini, source: "server".into(), capabilities: item.get("supportedGenerationMethods").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(), context_window: context_window(item), parameter_count_billions: parameter_count_billions(item), reasoning: None } })).collect();
     Ok((target, models, 0.98))
 }
 
@@ -535,6 +608,187 @@ mod tests {
         });
         (format!("http://{address}/v1/responses"), handle)
     }
+    type Recorded = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// 按路径片段路由的 mock server：(路径片段, status, body)。
+    /// `hang` 里的片段只接收不回应，用于制造 timeout。
+    fn mock_routed_server(routes: Vec<(&'static str, u16, &'static str)>, hang: Vec<&'static str>) -> (String, Recorded) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let recorded: Recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&recorded);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk) else { break };
+                    if read == 0 { break; }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else { continue };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                    }).unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length { break; }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                sink.lock().unwrap().push(request.clone());
+                let line = request.lines().next().unwrap_or("").to_owned();
+                if hang.iter().any(|route| line.contains(route)) {
+                    // 持有连接不回应：客户端只能等到 timeout。
+                    thread::spawn(move || { thread::sleep(Duration::from_secs(30)); drop(stream); });
+                    continue;
+                }
+                let (status, body) = routes.iter().find(|(route, _, _)| line.contains(route))
+                    .map(|(_, status, body)| (*status, *body)).unwrap_or((404, "{}"));
+                let reason = if (200..300).contains(&status) { "OK" } else { "Error" };
+                let _ = write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        (format!("http://{address}/v1"), recorded)
+    }
+
+    fn draft_for(base_url: &str, model: &str, protocol: ProtocolKind) -> ProviderDraft {
+        ProviderDraft {
+            id: None, name: "test".into(), base_url: base_url.into(), api_key: "test-key".into(),
+            protocol_hint: Some(protocol), timeout_seconds: 3, azure_api_version: None,
+            default_model: Some(model.into()), claude_model_profile: None,
+            claude_extended_context: false, claude_model_mappings: Default::default(),
+        }
+    }
+
+    fn probe_for(base_url: &str, model: ModelInfo, protocol: ProtocolKind) -> ProbeResult {
+        ProbeResult {
+            normalized_base_url: base_url.into(), protocol, confidence: 0.9, models: vec![model],
+            codex_compatibility: if matches!(protocol, ProtocolKind::Openai) { CodexCompatibility::Unknown } else { CodexCompatibility::NotApplicable },
+            codex_probe_model: None, codex_probe_detail: None, checked_endpoints: Vec::new(),
+            user_message: String::new(), technical_detail: None, reasoning_note: None,
+        }
+    }
+
+    fn model_for(id: &str, protocol: ProtocolKind, context_window: Option<u64>) -> ModelInfo {
+        ModelInfo {
+            id: id.into(), display_name: id.into(), provider: None, protocol, source: "test".into(),
+            capabilities: Vec::new(), context_window, parameter_count_billions: None, reasoning: None,
+        }
+    }
+
+    /// 要求 1：save_provider 走到的 refresh_selected_capabilities 会为 OpenAI 自动发现推理能力，
+    /// 且不影响 Codex 兼容性结论。
+    #[tokio::test]
+    async fn openai_model_selection_triggers_reasoning_discovery() {
+        let (base_url, _recorded) = mock_routed_server(vec![
+            ("/v1/models/gpt-x", 200, r#"{"id":"gpt-x","context_window":200000,"capabilities":{"reasoning":{"effort":["low","medium","high"]}}}"#),
+            ("/v1/responses", 200, r#"{"id":"resp_1","output":[]}"#),
+        ], Vec::new());
+        let draft = draft_for(&base_url, "gpt-x", ProtocolKind::Openai);
+        let mut probe = probe_for(&base_url, model_for("gpt-x", ProtocolKind::Openai, None), ProtocolKind::Openai);
+
+        refresh_selected_capabilities(&draft, &AppSettings::default(), &mut probe).await;
+
+        let reasoning = probe.models[0].reasoning.as_ref().expect("未生成 ReasoningCapability");
+        assert_eq!(reasoning.support, crate::reasoning_capability::ReasoningSupport::Supported);
+        assert!(!reasoning.tiers.is_empty());
+        assert_eq!(reasoning.key.model_id, "gpt-x");
+        // 既有流程未被破坏：context_window 补齐 + Codex 探测都照常完成。
+        assert_eq!(probe.models[0].context_window, Some(200_000));
+        assert_eq!(probe.codex_compatibility, CodexCompatibility::Full);
+        assert_eq!(probe.codex_probe_model.as_deref(), Some("gpt-x"));
+    }
+
+    /// 要求 2：Anthropic 自动发现。
+    #[tokio::test]
+    async fn anthropic_model_selection_triggers_reasoning_discovery() {
+        let (base_url, _recorded) = mock_routed_server(vec![
+            ("/v1/models/claude-x", 200, r#"{"id":"claude-x","capabilities":{"thinking":true},"thinking":{"budget_min":1024,"budget_max":32000}}"#),
+        ], Vec::new());
+        let draft = draft_for(&base_url, "claude-x", ProtocolKind::Anthropic);
+        let mut probe = probe_for(&base_url, model_for("claude-x", ProtocolKind::Anthropic, None), ProtocolKind::Anthropic);
+
+        refresh_selected_capabilities(&draft, &AppSettings::default(), &mut probe).await;
+
+        let reasoning = probe.models[0].reasoning.as_ref().expect("未生成 ReasoningCapability");
+        assert_eq!(reasoning.support, crate::reasoning_capability::ReasoningSupport::Supported);
+        // Anthropic 不参与 Codex 探测，结论保持 NotApplicable。
+        assert_eq!(probe.codex_compatibility, CodexCompatibility::NotApplicable);
+    }
+
+    /// 要求 3：Gemini 自动发现（此前被协议门禁完全挡住）。
+    #[tokio::test]
+    async fn gemini_model_selection_triggers_reasoning_discovery() {
+        let (base_url, recorded) = mock_routed_server(vec![
+            ("/v1beta/models/gemini-x", 200, r#"{"name":"models/gemini-x","thinkingConfig":{"thinkingBudgetMin":0,"thinkingBudgetMax":24576}}"#),
+        ], Vec::new());
+        let draft = draft_for(&base_url, "gemini-x", ProtocolKind::Gemini);
+        let mut probe = probe_for(&base_url, model_for("gemini-x", ProtocolKind::Gemini, None), ProtocolKind::Gemini);
+
+        refresh_selected_capabilities(&draft, &AppSettings::default(), &mut probe).await;
+
+        let reasoning = probe.models[0].reasoning.as_ref().expect("未生成 ReasoningCapability");
+        assert_eq!(reasoning.support, crate::reasoning_capability::ReasoningSupport::Supported);
+        // context_window 行为不变：Gemini 依旧不访问通用 /v1/models/{id}。
+        let requests = recorded.lock().unwrap().clone();
+        assert!(requests.iter().all(|item| !item.contains("/v1/models/gemini-x")), "Gemini 意外访问了通用模型详情端点");
+        assert_eq!(probe.models[0].context_window, None);
+        assert_eq!(probe.codex_compatibility, CodexCompatibility::NotApplicable);
+    }
+
+    /// 要求 4：discovery timeout 不影响保存。函数签名不返回 Result，
+    /// 这里验证它正常返回、既有能力与既有探测结论都完好。
+    #[tokio::test]
+    async fn discovery_timeout_does_not_break_the_flow() {
+        let (base_url, _recorded) = mock_routed_server(
+            vec![("/v1/models/claude-x", 200, r#"{"id":"claude-x"}"#)],
+            vec!["/v1/messages"],
+        );
+        let draft = draft_for(&base_url, "claude-x", ProtocolKind::Anthropic);
+        let mut model = model_for("claude-x", ProtocolKind::Anthropic, Some(180_000));
+        let previous = crate::reasoning_capability::ReasoningCapability::from_effort_enum(
+            crate::reasoning_capability::ReasoningKey::new(&base_url, "claude-x"),
+            &["low".into(), "high".into()],
+            crate::reasoning_capability::ReasoningConfidence::Declared,
+        );
+        model.reasoning = Some(stale_capability(previous));
+        let mut probe = probe_for(&base_url, model, ProtocolKind::Anthropic);
+
+        refresh_selected_capabilities(&draft, &AppSettings::default(), &mut probe).await;
+
+        // 旧能力必须完好保留，且给出说明而不是抛错。
+        let reasoning = probe.models[0].reasoning.as_ref().expect("timeout 后丢失了旧能力");
+        assert_eq!(reasoning.support, crate::reasoning_capability::ReasoningSupport::Supported);
+        assert_eq!(reasoning.tiers.len(), 2);
+        assert!(probe.reasoning_note.is_some(), "timeout 应记入 note");
+        assert_eq!(probe.models[0].context_window, Some(180_000));
+    }
+
+    /// 要求 5：已缓存且未过期的能力不重复请求。
+    #[tokio::test]
+    async fn cached_capability_skips_network_requests() {
+        let (base_url, recorded) = mock_routed_server(vec![
+            ("/v1/models/claude-x", 200, r#"{"id":"claude-x","capabilities":{"thinking":true}}"#),
+        ], Vec::new());
+        let draft = draft_for(&base_url, "claude-x", ProtocolKind::Anthropic);
+        let mut model = model_for("claude-x", ProtocolKind::Anthropic, Some(180_000));
+        model.reasoning = Some(crate::reasoning_capability::ReasoningCapability::from_effort_enum(
+            crate::reasoning_capability::ReasoningKey::new(&base_url, "claude-x"),
+            &["low".into(), "medium".into(), "high".into()],
+            crate::reasoning_capability::ReasoningConfidence::Declared,
+        ));
+        let mut probe = probe_for(&base_url, model, ProtocolKind::Anthropic);
+
+        refresh_selected_capabilities(&draft, &AppSettings::default(), &mut probe).await;
+
+        assert!(recorded.lock().unwrap().is_empty(), "缓存有效却仍发起了请求");
+        assert_eq!(probe.models[0].reasoning.as_ref().unwrap().tiers.len(), 3);
+    }
+
+    fn stale_capability(mut capability: crate::reasoning_capability::ReasoningCapability) -> crate::reasoning_capability::ReasoningCapability {
+        capability.discovered_at = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+        capability
+    }
+
     #[test]
     fn normalizes_urls_without_overwriting_http() {
         assert_eq!(normalize_base_url(" api.example.com/v1/ ").unwrap(), "https://api.example.com/v1");
