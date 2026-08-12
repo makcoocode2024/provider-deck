@@ -16,6 +16,8 @@ import type {
   ReasoningSelection,
   ReasoningTier,
   ReasoningTierOption,
+  RuntimeVerification,
+  VerificationStatus,
 } from "./types";
 
 /**
@@ -141,6 +143,12 @@ const confidenceLabels: Record<ReasoningConfidence, string> = {
   unknown: "未探明",
   declared: "服务端声明",
   validated: "参数校验确认",
+  // Verified confidence is reserved for future capability validation and is not
+  // produced by runtime verification.
+  //
+  // 这一档只在后端 discovery 链路里可能出现（目前生产代码无一处写入）。用户点一次
+  // 「验证」不会把 confidence 抬到这里——运行时验证的结论走 verificationSummary()，
+  // 与 confidence 是两个互不相通的渠道。
   verified: "真实响应证实",
 };
 
@@ -163,4 +171,129 @@ export function stateMessage(state: ReasoningUiState): string | undefined {
 /** 约束说明，直接来自后端；前端不添加解释。 */
 export function constraintNotes(capability?: ReasoningCapability | null): string[] {
   return capability?.constraints.notes ?? [];
+}
+
+// —— 运行时验证的投影。
+//
+// 这一段只读 `Provider.reasoningVerifications`，**从不**读写 `capability.confidence`
+// 或 `capability.evidence`：验证是用户行为历史，能力是系统探测事实，两者在 UI 上
+// 必须能分别看到。混成一个指标就再也分不清"系统认为支持"和"我试过能用"。
+
+/** 某个模型的验证历史。后端按时间追加，这里原样返回，不排序、不去重。 */
+export function verificationsFor(
+  verifications: Record<string, RuntimeVerification[]> | undefined,
+  modelId: string | undefined,
+): RuntimeVerification[] {
+  if (!verifications || !modelId) return [];
+  return verifications[modelId] ?? [];
+}
+
+/**
+ * 最新一条验证记录。
+ *
+ * 取数组末尾而不是按 `verifiedAt` 排序：后端是追加写入，数组顺序就是权威时间顺序，
+ * 不需要解析任何时间戳。RFC3339 的字典序并不等于时序——带偏移量的写法（`+08:00`）
+ * 比较的是本地小时位而不是真实瞬间，一旦混入就会排错。
+ */
+export function latestVerification(
+  verifications: Record<string, RuntimeVerification[]> | undefined,
+  modelId: string | undefined,
+): RuntimeVerification | undefined {
+  const history = verificationsFor(verifications, modelId);
+  return history.length > 0 ? history[history.length - 1] : undefined;
+}
+
+/**
+ * 某个档位上最新的验证记录。
+ *
+ * 按档位过滤而不是只看全局最新：用户可能先验 deep 再验 light，此时"当前选中档位
+ * 验过没有"才是他要的答案，而不是"最后一次验的是什么"。
+ */
+export function latestVerificationForTier(
+  verifications: Record<string, RuntimeVerification[]> | undefined,
+  modelId: string | undefined,
+  tier: ReasoningTier | undefined,
+): RuntimeVerification | undefined {
+  if (!tier) return undefined;
+  const matching = verificationsFor(verifications, modelId).filter((record) => record.tier === tier);
+  return matching.length > 0 ? matching[matching.length - 1] : undefined;
+}
+
+/**
+ * 可供验证的档位；`undefined` 表示此刻不该允许验证。
+ *
+ * 三种情况没有可验证目标：能力不支持或未探明、压根没有生效档位、以及用户在"高级"区
+ * 钉死了显式 binding——后者 {@link activeTier} 按设计返回 undefined，而后端 command
+ * 只接受 tier，没有可断言的档位。
+ */
+export function verifiableTier(
+  capability?: ReasoningCapability | null,
+  selection?: ReasoningSelection | null,
+): ReasoningTier | undefined {
+  if (reasoningUiState(capability) !== "supported") return undefined;
+  return activeTier(capability, selection);
+}
+
+/**
+ * 把新记录追加进验证历史，返回新对象（不改入参）。
+ *
+ * 追加而非覆盖，与 {@link upsertSelection} 的覆盖语义刻意相反：选择只有"当前值"，
+ * 验证有"发生过什么"。Rejected / Failed 同样留痕——抹掉失败等于让用户反复点同一个
+ * 按钮却看不出上次的结果。
+ */
+export function appendVerification(
+  verifications: Record<string, RuntimeVerification[]> | undefined,
+  incoming: RuntimeVerification,
+): Record<string, RuntimeVerification[]> {
+  const current = verifications ?? {};
+  return {
+    ...current,
+    [incoming.modelId]: [...(current[incoming.modelId] ?? []), incoming],
+  };
+}
+
+/**
+ * 验证记录里的档位名。取自能力表的 `label`，能力表里没有这一档时退回后端返回的原始
+ * tier 值——那也是后端数据，不是前端自造的词。
+ */
+export function verificationTierLabel(
+  verification: RuntimeVerification,
+  capability?: ReasoningCapability | null,
+): string {
+  return tierOptions(capability).find((option) => option.tier === verification.tier)?.label
+    ?? verification.tier;
+}
+
+export interface VerificationSummary {
+  status: VerificationStatus;
+  /** 主文案，可直接展示。 */
+  label: string;
+  /** 补充说明：rejected 的 reason、failed 的 error。confirmed 没有。 */
+  detail?: string;
+}
+
+/**
+ * 三态文案。
+ *
+ * 三条文案都刻意避开"不支持"二字：`rejected` 说的是"这一次响应里没看到推理产物"，
+ * `failed` 说的是"这一次请求没走通"，两者都不构成能力结论。能力是否支持只由
+ * {@link reasoningUiState} 回答，它读的是 `capability.support`。
+ */
+export function verificationSummary(
+  verification: RuntimeVerification,
+  capability?: ReasoningCapability | null,
+): VerificationSummary {
+  const tierName = verificationTierLabel(verification, capability);
+  switch (verification.result.status) {
+    case "confirmed":
+      return { status: "confirmed", label: `已验证 ${tierName}` };
+    case "rejected":
+      return {
+        status: "rejected",
+        label: `此 endpoint 下「${tierName}」未检测到推理产物`,
+        detail: verification.result.reason,
+      };
+    case "failed":
+      return { status: "failed", label: "验证失败", detail: verification.result.error };
+  }
 }

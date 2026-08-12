@@ -22,7 +22,14 @@ export interface ClaudeModelMappings {
 /** 三态结论。unknown 必须可表达：未探明 ≠ 不支持。 */
 export type ReasoningSupport = "unknown" | "unsupported" | "supported";
 
-/** 置信度阶梯，与四级证据阶梯一一对应。 */
+/**
+ * 置信度阶梯，与四级证据阶梯一一对应。后端 `ReasoningConfidence` 的镜像。
+ *
+ * `verified` 保留给未来的 capability validation，**不由 runtime verification 产生**。
+ * 后端生产代码目前没有任何一处写入这一档（唯一出现处是 `lib.rs` 的测试 fixture），
+ * Phase D 也不写、不读、不展示它。运行时验证的结论一律走 {@link RuntimeVerification}，
+ * 落在 {@link Provider.reasoningVerifications}，不回写 {@link ModelInfo.reasoning}。
+ */
 export type ReasoningConfidence = "unknown" | "declared" | "validated" | "verified";
 
 export type EvidenceSource =
@@ -112,6 +119,45 @@ export interface ReasoningSelection {
   chosenAt: string;
 }
 
+// —— 运行时验证。后端 reasoning_verification.rs 的镜像。
+//
+// 与上面的能力发现是两条独立链路：能力发现回答"这个端点的这个模型支持什么"，写
+// `ModelInfo.reasoning`；运行时验证回答"用户在这个端点上试过什么、结果如何"，写
+// `Provider.reasoningVerifications`。两者互不回写——一次成功的用户请求不构成探测事实。
+
+/** 三态判别值。与后端 `VerificationResult` 的 serde tag 同名。 */
+export type VerificationStatus = "confirmed" | "rejected" | "failed";
+
+/**
+ * 验证结论。内部标签联合，判别字段是 `status`（后端 `#[serde(tag = "status")]`）。
+ *
+ * `rejected` 与 `failed` 都**不等于**"不支持推理"：前者是"这次响应里没看到推理产物"，
+ * 后者是"这次请求没走通"。能力结论只由 {@link ReasoningCapability.support} 表达。
+ */
+export type VerificationResult =
+  | { status: "confirmed" }
+  | { status: "rejected"; reason: string }
+  | { status: "failed"; error: string };
+
+/**
+ * 单次运行时验证记录。只含判定所需的字段——不含 API key、请求体、响应原文。
+ *
+ * 归属 `(baseUrl, modelId)`：换端点后旧记录一律作废（后端 `retain_for_endpoint` 负责剪枝），
+ * 因为它断言的是某个端点的运行时行为，不是用户意图。
+ */
+export interface RuntimeVerification {
+  modelId: string;
+  /** 已归一化的 base URL。 */
+  baseUrl: string;
+  tier: ReasoningTier;
+  /** 验证时实际发出的绑定，由后端从能力表派生，供 UI 显示"当时发了什么"。 */
+  binding: ReasoningBinding;
+  result: VerificationResult;
+  /** RFC3339 时间戳。 */
+  verifiedAt: string;
+  protocol: string;
+}
+
 export interface ModelInfo {
   id: string;
   displayName: string;
@@ -139,6 +185,12 @@ export interface Provider {
   codexProbeModel?: string;
   codexProbeDetail?: string;
   reasoningSelections?: ReasoningSelection[];
+  /**
+   * 用户主动发起的运行时验证历史，key 为 modelId，值按时间追加。
+   *
+   * 可选是因为旧的本地数据没有这个字段；后端始终会序列化它（`#[serde(default)]`）。
+   */
+  reasoningVerifications?: Record<string, RuntimeVerification[]>;
   models: ModelInfo[];
   connectionState: ConnectionState;
   confidence?: number;
