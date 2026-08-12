@@ -151,6 +151,7 @@ mod tests {
             claude_extended_context: false, claude_model_mappings: ClaudeModelMappings::default(),
             codex_compatibility: CodexCompatibility::Full, codex_probe_model: None,
             codex_probe_detail: None, reasoning_selections: vec![],
+            reasoning_verifications: Default::default(),
             models: vec![model], connection_state: "connected".into(),
             confidence: None, last_checked_at: None, applied_clients: vec![], error_summary: None,
         }

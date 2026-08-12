@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -234,6 +236,41 @@ async fn send_verification_request(
     }
 }
 
+/// 判断一条验证记录是否仍属于给定的 (base_url, model_id)。
+///
+/// base_url 两侧都归一化后比较：用户原始输入的尾斜杠/大小写差异不该让记录失效。
+/// model_id 走字面比较——模型标识符大小写敏感，`GPT-4` 与 `gpt-4` 是两个模型。
+pub fn belongs_to(verification: &RuntimeVerification, base_url: &str, model_id: &str) -> bool {
+    if verification.model_id != model_id {
+        return false;
+    }
+    let stored = normalize_base_url(&verification.base_url).unwrap_or_else(|_| verification.base_url.clone());
+    let current = normalize_base_url(base_url).unwrap_or_else(|_| base_url.to_string());
+    stored == current
+}
+
+/// 剪掉不再属于当前端点或已消失模型的验证记录。
+///
+/// 两条规则同时生效：
+/// - 记录里的 base_url 与当前端点不一致 → 丢弃（换端点等于换了被断言的对象）
+/// - model_id 不在当前模型列表里 → 丢弃（模型没了，记录无处展示）
+///
+/// 这与 [`crate::reasoning_selection::prune_missing`] 的"只按 model_id 剪枝"是刻意的不对称：
+/// 选择是用户意图，换端点后依然成立；验证是对某个端点运行时行为的事实断言，换端点即失效。
+pub fn retain_for_endpoint(
+    verifications: &mut HashMap<String, Vec<RuntimeVerification>>,
+    base_url: &str,
+    models: &[crate::model::ModelInfo],
+) {
+    verifications.retain(|model_id, records| {
+        if !models.iter().any(|model| &model.id == model_id) {
+            return false;
+        }
+        records.retain(|record| belongs_to(record, base_url, model_id));
+        !records.is_empty()
+    });
+}
+
 fn protocol_kind_to_string(protocol: ProtocolKind) -> String {
     match protocol {
         ProtocolKind::Openai => "openai".to_string(),
@@ -328,6 +365,202 @@ mod tests {
         let json = serde_json::to_value(result).unwrap();
         assert_eq!(json["status"], "failed");
         assert_eq!(json["error"], "网络超时");
+    }
+
+    fn record(base_url: &str, model_id: &str, tier: ReasoningTier) -> RuntimeVerification {
+        RuntimeVerification {
+            model_id: model_id.into(),
+            base_url: base_url.into(),
+            tier,
+            binding: ReasoningBinding::Effort { value: "high".into() },
+            result: VerificationResult::Confirmed,
+            verified_at: "2026-08-12T10:30:00Z".into(),
+            protocol: "openai".into(),
+        }
+    }
+
+    fn model_info(id: &str) -> crate::model::ModelInfo {
+        crate::model::ModelInfo {
+            id: id.into(),
+            display_name: id.into(),
+            provider: None,
+            protocol: ProtocolKind::Openai,
+            source: "test".into(),
+            capabilities: Vec::new(),
+            context_window: None,
+            parameter_count_billions: None,
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn same_endpoint_and_model_belongs() {
+        let verification = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        assert!(belongs_to(&verification, "https://api.example.com/v1", "gpt-x"));
+    }
+
+    /// 端点变了就是换了被断言的对象，旧记录不能继续展示。
+    #[test]
+    fn foreign_base_url_does_not_belong() {
+        let verification = record("https://old.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        assert!(!belongs_to(&verification, "https://new.example.com/v1", "gpt-x"));
+    }
+
+    /// model_id 走字面比较：大小写不同就是两个模型。
+    #[test]
+    fn foreign_model_id_does_not_belong() {
+        let verification = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        assert!(!belongs_to(&verification, "https://api.example.com/v1", "gpt-y"));
+        assert!(!belongs_to(&verification, "https://api.example.com/v1", "GPT-X"));
+    }
+
+    /// 书写差异（尾斜杠）不该让记录失效，否则每次保存都会清空历史。
+    #[test]
+    fn normalized_base_url_still_belongs() {
+        let verification = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        assert!(belongs_to(&verification, "https://api.example.com/v1/", "gpt-x"));
+    }
+
+    #[test]
+    fn retain_keeps_records_for_the_same_endpoint() {
+        let mut map = HashMap::new();
+        map.insert("gpt-x".to_string(), vec![record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep)]);
+        retain_for_endpoint(&mut map, "https://api.example.com/v1", &[model_info("gpt-x")]);
+        assert_eq!(map.get("gpt-x").map(Vec::len), Some(1));
+    }
+
+    /// base_url 改变后旧验证记录必须被清掉。
+    #[test]
+    fn retain_drops_records_after_endpoint_change() {
+        let mut map = HashMap::new();
+        map.insert("gpt-x".to_string(), vec![record("https://old.example.com/v1", "gpt-x", ReasoningTier::Deep)]);
+        retain_for_endpoint(&mut map, "https://new.example.com/v1", &[model_info("gpt-x")]);
+        assert!(map.is_empty(), "换端点后旧验证记录仍然留着：{map:?}");
+    }
+
+    /// 模型从列表里消失后对应的记录一并清掉。
+    #[test]
+    fn retain_drops_records_for_missing_models() {
+        let mut map = HashMap::new();
+        map.insert("gone".to_string(), vec![record("https://api.example.com/v1", "gone", ReasoningTier::Deep)]);
+        map.insert("kept".to_string(), vec![record("https://api.example.com/v1", "kept", ReasoningTier::Deep)]);
+        retain_for_endpoint(&mut map, "https://api.example.com/v1", &[model_info("kept")]);
+        assert!(!map.contains_key("gone"));
+        assert!(map.contains_key("kept"));
+    }
+
+    /// 不同模型的历史各自独立，剪枝不得串味。
+    #[test]
+    fn records_never_mix_between_models() {
+        let mut map = HashMap::new();
+        map.insert("gpt-x".to_string(), vec![record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep)]);
+        // 故意放一条 key 与内部 model_id 不一致的脏记录，剪枝要把它清掉。
+        map.insert("gpt-y".to_string(), vec![record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep)]);
+        retain_for_endpoint(&mut map, "https://api.example.com/v1", &[model_info("gpt-x"), model_info("gpt-y")]);
+        assert_eq!(map.get("gpt-x").map(Vec::len), Some(1));
+        assert!(!map.contains_key("gpt-y"), "model_id 与 key 不一致的记录被保留了");
+    }
+
+    /// 同一档位重复验证要追加历史，不是覆盖——用户要看到"上次通过、这次失败"。
+    #[test]
+    fn repeated_verification_appends_history() {
+        let mut map: HashMap<String, Vec<RuntimeVerification>> = HashMap::new();
+        map.entry("gpt-x".into()).or_default().push(record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep));
+        let mut second = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        second.verified_at = "2026-08-12T11:00:00Z".into();
+        second.result = VerificationResult::Rejected { reason: "未检测到推理字段".into() };
+        map.entry("gpt-x".into()).or_default().push(second);
+
+        let history = map.get("gpt-x").expect("history missing");
+        assert_eq!(history.len(), 2, "第二次验证覆盖了第一条记录");
+        assert!(matches!(history[0].result, VerificationResult::Confirmed));
+        assert!(matches!(history[1].result, VerificationResult::Rejected { .. }));
+        // 剪枝不能因为存在 Rejected 就丢历史。
+        retain_for_endpoint(&mut map, "https://api.example.com/v1", &[model_info("gpt-x")]);
+        assert_eq!(map.get("gpt-x").map(Vec::len), Some(2));
+    }
+
+    /// 三态一律入库：Rejected 是有效负事实，Failed 是排障线索，都属于用户验证历史。
+    /// 之所以不过滤掉失败态：隐藏它们等于让用户反复点同一个按钮却看不到痕迹。
+    #[test]
+    fn failed_and_rejected_records_are_persisted() {
+        let mut map: HashMap<String, Vec<RuntimeVerification>> = HashMap::new();
+
+        let mut rejected = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        rejected.result = VerificationResult::Rejected { reason: "响应中没有推理产物".into() };
+        map.entry("gpt-x".into()).or_default().push(rejected);
+
+        let mut failed = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        failed.verified_at = "2026-08-12T11:05:00Z".into();
+        failed.result = VerificationResult::Failed { error: "连接上游超时".into() };
+        map.entry("gpt-x".into()).or_default().push(failed);
+
+        let history = map.get("gpt-x").expect("history missing");
+        assert_eq!(history.len(), 2, "失败态记录被丢弃了");
+        assert!(matches!(history[0].result, VerificationResult::Rejected { .. }));
+        assert!(matches!(history[1].result, VerificationResult::Failed { .. }));
+
+        // 剪枝不得因为记录是失败态就清掉它。
+        retain_for_endpoint(&mut map, "https://api.example.com/v1", &[model_info("gpt-x")]);
+        assert_eq!(map.get("gpt-x").map(Vec::len), Some(2), "剪枝把失败记录清掉了");
+    }
+
+    /// Rejected/Failed 入库后 capability 的 confidence 必须原封不动。
+    /// 这是 discovery 与 verification 两条链路隔离的底线：用户验证行为不回写系统能力事实。
+    #[test]
+    fn persisting_failures_leaves_confidence_untouched() {
+        use crate::reasoning_capability::{ReasoningCapability, ReasoningConfidence, ReasoningKey};
+
+        let capability = ReasoningCapability::from_effort_enum(
+            ReasoningKey::new("https://api.example.com/v1", "gpt-x"),
+            &["low".into(), "high".into()],
+            ReasoningConfidence::Declared,
+        );
+        let before = capability.confidence;
+
+        let mut map: HashMap<String, Vec<RuntimeVerification>> = HashMap::new();
+        for result in [
+            VerificationResult::Rejected { reason: "无推理产物".into() },
+            VerificationResult::Failed { error: "网络不可达".into() },
+            VerificationResult::Confirmed,
+        ] {
+            let mut entry = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+            entry.result = result;
+            map.entry("gpt-x".into()).or_default().push(entry);
+        }
+
+        assert_eq!(capability.confidence, before, "验证历史改动了 discovery 的 confidence");
+        assert_eq!(capability.confidence, ReasoningConfidence::Declared);
+        assert_eq!(map.get("gpt-x").map(Vec::len), Some(3));
+    }
+
+    /// 失败态不得覆盖此前的 Confirmed：历史按时间追加，UI 自己决定怎么呈现。
+    #[test]
+    fn failure_does_not_erase_earlier_confirmation() {
+        let mut map: HashMap<String, Vec<RuntimeVerification>> = HashMap::new();
+        map.entry("gpt-x".into()).or_default().push(record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep));
+
+        let mut later = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        later.verified_at = "2026-08-12T12:00:00Z".into();
+        later.result = VerificationResult::Failed { error: "429 Too Many Requests".into() };
+        map.entry("gpt-x".into()).or_default().push(later);
+
+        let history = map.get("gpt-x").expect("history missing");
+        assert_eq!(history.len(), 2);
+        assert!(
+            matches!(history[0].result, VerificationResult::Confirmed),
+            "先前的 Confirmed 被失败记录覆盖了"
+        );
+    }
+
+    /// 验证记录不得携带凭据或请求/响应原文。
+    #[test]
+    fn verification_record_carries_no_secrets() {
+        let verification = record("https://api.example.com/v1", "gpt-x", ReasoningTier::Deep);
+        let serialized = serde_json::to_string(&verification).expect("serialize failed");
+        for forbidden in ["apiKey", "api_key", "sk-", "messages", "请回复 OK"] {
+            assert!(!serialized.contains(forbidden), "验证记录里出现了 {forbidden}：{serialized}");
+        }
     }
 
     #[test]

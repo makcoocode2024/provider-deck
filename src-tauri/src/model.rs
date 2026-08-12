@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::reasoning_capability::ReasoningCapability;
 use crate::reasoning_selection::ReasoningSelection;
+use crate::reasoning_verification::RuntimeVerification;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -113,6 +114,14 @@ pub struct Provider {
     /// 同时守住"ModelInfo 装发现到的事实，Provider 装用户的意图"这条边界。
     #[serde(default)]
     pub reasoning_selections: Vec<ReasoningSelection>,
+    /// 用户主动发起的运行时验证历史，key 为 model_id。
+    ///
+    /// 与 `ModelInfo.reasoning` 分开：那边装 discovery 探测到的能力事实，这里装用户行为记录。
+    /// 挂 Provider 而不是 ModelInfo，是因为验证归属"此 endpoint 下的此模型"——
+    /// base_url 变了旧记录一律作废，而 models 在 save/reprobe/refresh 三处整体替换，
+    /// 挂进去每次刷新都要靠迁移逻辑救一次。
+    #[serde(default)]
+    pub reasoning_verifications: HashMap<String, Vec<RuntimeVerification>>,
     pub models: Vec<ModelInfo>,
     pub connection_state: String,
     pub confidence: Option<f64>,

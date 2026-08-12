@@ -91,6 +91,14 @@ async fn save_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy
                 reasoning_selection::prune_missing(&mut merged, &probe.models);
                 merged
             },
+            // 验证记录绑定 (base_url, model_id)：端点变了旧记录一律作废，
+            // 端点没变则只剪掉已消失的模型。与 reasoning_selections 的"只按 model_id 剪枝"
+            // 是刻意的不对称——选择是用户意图，验证是对某个端点的事实断言。
+            reasoning_verifications: {
+                let mut carried = existing.as_ref().map(|p| p.reasoning_verifications.clone()).unwrap_or_default();
+                reasoning_verification::retain_for_endpoint(&mut carried, &probe.normalized_base_url, &probe.models);
+                carried
+            },
             models: probe.models.clone(), connection_state: "connected".into(), confidence: Some(probe.confidence),
             last_checked_at: Some(Utc::now().to_rfc3339()), applied_clients: existing.map(|p| p.applied_clients).unwrap_or_default(), error_summary: None,
         };
@@ -189,6 +197,9 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
                     // 只剪掉真的消失了的模型：换端点不影响"用户想要什么档位"。
                     let models_snapshot = saved.models.clone();
                     reasoning_selection::prune_missing(&mut saved.reasoning_selections, &models_snapshot);
+                    // 验证记录相反：端点变了就全作废，因为它断言的是某个端点的运行时行为。
+                    let verification_base_url = saved.base_url.clone();
+                    reasoning_verification::retain_for_endpoint(&mut saved.reasoning_verifications, &verification_base_url, &models_snapshot);
                     saved.connection_state = "connected".into();
                     saved.confidence = Some(probe.confidence);
                     saved.last_checked_at = Some(Utc::now().to_rfc3339());
@@ -357,6 +368,8 @@ async fn refresh_provider_models(store: State<'_, StateStore>, provider_id: Stri
                 saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
                 let models_snapshot = saved.models.clone();
                 reasoning_selection::prune_missing(&mut saved.reasoning_selections, &models_snapshot);
+                // 这条路径不动端点，验证记录只需按 model_id 剪枝。
+                reasoning_verification::retain_for_endpoint(&mut saved.reasoning_verifications, &target_base_url, &models_snapshot);
                 saved.connection_state = "connected".into();
                 saved.confidence = Some(confidence);
                 saved.last_checked_at = Some(Utc::now().to_rfc3339());
@@ -388,6 +401,48 @@ async fn test_provider(store: State<'_, StateStore>, provider_id: String, model_
     let settings = state.settings.clone();
     let draft = provider_draft(&provider, credentials::get(&provider.id)?, &settings);
     protocol::test_conversation(provider_id, &draft, model_id, &settings).await
+}
+
+/// 用户主动验证某个模型的某一推理档位是否真的生效。
+///
+/// 与 discovery 的分工：这里发一次真实请求看响应里有没有推理产物，结论落
+/// `provider.reasoning_verifications`，**不碰** `model.reasoning`——包括 confidence。
+/// 用户的一次成功请求不是探测事实，两条链路各自记账。
+#[tauri::command]
+async fn verify_model_reasoning(
+    store: State<'_, StateStore>,
+    provider_id: String,
+    model_id: String,
+    tier: reasoning_capability::ReasoningTier,
+) -> AppResult<reasoning_verification::RuntimeVerification> {
+    let state = store.read();
+    let provider = state.providers.iter().find(|provider| provider.id == provider_id).cloned()
+        .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+    let model = provider.models.iter().find(|model| model.id == model_id).cloned()
+        .ok_or_else(|| AppError::InvalidInput(format!("模型 {model_id} 不属于该服务")))?;
+    let capability = model.reasoning.clone()
+        .ok_or_else(|| AppError::InvalidInput("该模型尚未探明推理能力，无法验证".into()))?;
+    let api_key = credentials::get(&provider.id)?;
+
+    let verification = reasoning_verification::verify_reasoning_capability(
+        &provider.base_url,
+        &model_id,
+        &api_key,
+        model.protocol,
+        &capability,
+        tier,
+    ).await?;
+
+    // 存储由 command 层负责：verification 模块不知道 Provider 的结构。
+    // 三态一律入库——Rejected/Failed 也是用户需要看到的历史，隐藏它们等于让用户重复点。
+    store.update(|state| {
+        let saved = state.providers.iter_mut().find(|item| item.id == provider_id)
+            .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+        saved.reasoning_verifications.entry(model_id.clone()).or_default().push(verification.clone());
+        Ok(())
+    })?;
+
+    Ok(verification)
 }
 
 #[tauri::command]
@@ -573,7 +628,7 @@ pub fn run() {
     })
     .manage(store).manage(proxy).manage(chats).invoke_handler(tauri::generate_handler![
         list_providers, get_provider_api_key, save_provider, delete_provider, set_current_provider, probe_provider, reprobe_provider, detect_clients,
-        refresh_provider_models, reprobe_model_reasoning, test_provider,
+        refresh_provider_models, reprobe_model_reasoning, verify_model_reasoning, test_provider,
         preview_changes, apply_changes, list_backups, restore_backup, get_settings, save_settings,
         list_chat_backups, chat_cache_summary, export_chat_backup, restore_chat_backup_file, restore_chat_backup_payload, restore_chat_cache, rollback_chat_restore,
         export_providers, import_providers, diagnostics

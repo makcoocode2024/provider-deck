@@ -290,6 +290,7 @@ mod tests {
             codex_compatibility: crate::model::CodexCompatibility::ChatProxy,
             codex_probe_model: Some("dynamic-model".into()), codex_probe_detail: None,
             reasoning_selections: vec![],
+            reasoning_verifications: Default::default(),
             models: vec![], connection_state: "connected".into(), confidence: Some(1.0),
             last_checked_at: None, applied_clients: vec![], error_summary: None,
         }
