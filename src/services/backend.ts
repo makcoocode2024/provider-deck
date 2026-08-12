@@ -469,7 +469,6 @@ class BrowserBackend implements AppBackend {
     const resolved: AppSettings = {
       ...settings,
       effectiveReasoningLevel: settings.manualReasoningLevel,
-      reasoningMatchMessage: settings.autoReasoningMode ? "浏览器测试模式不读取模型元数据和显存，暂时沿用手动档位" : undefined,
     };
     localStorage.setItem(this.settingsKey, JSON.stringify(resolved));
     return resolved;

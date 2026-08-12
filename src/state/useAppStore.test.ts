@@ -41,10 +41,8 @@ describe("normalizeProviderDraft", () => {
 
 describe("defaultSettings 的推理字段", () => {
   it("与 Rust AppSettings::default 保持一致，避免 serde 回填时重置推理状态", () => {
-    expect(defaultSettings.autoReasoningMode).toBe(false);
     expect(defaultSettings.manualReasoningLevel).toBe("high");
     expect(defaultSettings.effectiveReasoningLevel).toBe("high");
-    expect(defaultSettings.reasoningMatchMessage).toBeUndefined();
   });
 });
 
@@ -57,21 +55,19 @@ describe("updateSettings", () => {
   it("采用后端结算后的推理档位，而不是原样回写草稿", async () => {
     const settled: AppSettings = {
       ...defaultSettings,
-      autoReasoningMode: true,
       manualReasoningLevel: "low",
       effectiveReasoningLevel: "medium",
-      reasoningMatchMessage: "云端 API，不占用本机显存，自动选用中度推理模式",
     };
     mocks.saveSettings.mockResolvedValue(settled);
 
-    await useAppStore.getState().updateSettings({ ...defaultSettings, autoReasoningMode: true, manualReasoningLevel: "low" });
+    await useAppStore.getState().updateSettings({ ...defaultSettings, manualReasoningLevel: "low" });
 
     expect(useAppStore.getState().settings).toEqual(settled);
     expect(useAppStore.getState().operation).toBeUndefined();
   });
 
   it("修改无关设置时仍然回传推理字段，不会把它们重置为默认值", async () => {
-    const stored: AppSettings = { ...defaultSettings, autoReasoningMode: true, manualReasoningLevel: "low", effectiveReasoningLevel: "low" };
+    const stored: AppSettings = { ...defaultSettings, manualReasoningLevel: "low", effectiveReasoningLevel: "low" };
     mocks.saveSettings.mockImplementation(async (settings: AppSettings) => settings);
     useAppStore.setState({ settings: stored });
 
@@ -79,11 +75,11 @@ describe("updateSettings", () => {
 
     expect(mocks.saveSettings).toHaveBeenCalledWith(expect.objectContaining({
       timeoutSeconds: 45,
-      autoReasoningMode: true,
       manualReasoningLevel: "low",
+      effectiveReasoningLevel: "low",
     }));
-    expect(useAppStore.getState().settings.autoReasoningMode).toBe(true);
     expect(useAppStore.getState().settings.manualReasoningLevel).toBe("low");
+    expect(useAppStore.getState().settings.effectiveReasoningLevel).toBe("low");
   });
 
   it("保存失败时抛出错误并清除操作状态", async () => {

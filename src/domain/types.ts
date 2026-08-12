@@ -345,10 +345,9 @@ export interface AppSettings {
   clearClipboardSeconds: number;
   locale: "zh-CN" | "en-US";
   localProxyPort?: number;
-  autoReasoningMode: boolean;
   manualReasoningLevel: ReasoningLevel;
+  /** 由 `manualReasoningLevel` 派生，供 legacy fallback 使用。前端不自行计算。 */
   effectiveReasoningLevel: ReasoningLevel;
-  reasoningMatchMessage?: string;
 }
 
 export const defaultSettings: AppSettings = {
@@ -359,8 +358,6 @@ export const defaultSettings: AppSettings = {
   clearClipboardSeconds: 30,
   locale: "zh-CN",
   localProxyPort: undefined,
-  autoReasoningMode: false,
   manualReasoningLevel: "high",
   effectiveReasoningLevel: "high",
-  reasoningMatchMessage: undefined,
 };

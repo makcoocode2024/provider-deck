@@ -279,9 +279,9 @@ test("真实对话失败时展示明确检查结果", async ({ page }, testInfo)
   await expect(page.getByText(/模型不可用或无访问权限/)).toBeVisible();
 });
 
-// 以下三例断言的是“能力未探明时的回退档位”。每个模型的真实推理档位由该模型自己的
+// 以下两例断言的是“能力未探明时的回退档位”。每个模型的真实推理档位由该模型自己的
 // 能力探测决定（在“编辑服务 → 确认模型”里选），全局设置里只剩这个兜底档位，
-// 因此控件名是「回退档位」而不是「推理档位」。
+// 因此控件名是「回退档位」而不是「推理档位」。该档位只由用户显式选择，没有自动推荐。
 test("回退档位可以手动切换并在保存后持久化", async ({ page }, testInfo) => {
   await openSettings(page, testInfo);
   await expect(page.getByLabel("手动回退档位")).toHaveValue("high");
@@ -294,18 +294,6 @@ test("回退档位可以手动切换并在保存后持久化", async ({ page }, 
   if (testInfo.project.name === "narrow-chromium") await page.getByRole("button", { name: "打开导航" }).click();
   await page.getByRole("button", { name: "设置" }).click();
   await expect(page.getByLabel("手动回退档位")).toHaveValue("medium");
-});
-
-test("开启自动推荐会隐藏手动回退档位并保留已选档位", async ({ page }, testInfo) => {
-  await openSettings(page, testInfo);
-  await page.getByLabel("手动回退档位").selectOption("low");
-  await page.getByRole("switch", { name: "自动推荐回退档位" }).click();
-  await expect(page.getByLabel("手动回退档位")).toBeHidden();
-  await page.getByRole("button", { name: "保存设置" }).click();
-  await expect(page.getByRole("status")).toHaveText("设置已保存");
-
-  await page.getByRole("switch", { name: "自动推荐回退档位" }).click();
-  await expect(page.getByLabel("手动回退档位")).toHaveValue("low");
 });
 
 test("修改超时不会重置已保存的推理设置", async ({ page }, testInfo) => {
