@@ -137,7 +137,11 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
   const [formError, setFormError] = useState("");
   const [startingProbe, setStartingProbe] = useState(false);
   const [reprobingReasoning, setReprobingReasoning] = useState(false);
-  const { probe, saveProvider, reprobeModelReasoning, probeResult, operation, error, clearError } = useAppStore();
+  const [verifyingReasoning, setVerifyingReasoning] = useState(false);
+  const { probe, saveProvider, reprobeModelReasoning, verifyModelReasoning, probeResult, operation, error, clearError } = useAppStore();
+  // 验证历史取自 store 里已保存的 provider，而不是 initial：验证会往 store 追加记录，
+  // 读 initial 就看不到刚刚那一条。capability 仍走 probeResult，两条数据流各自的源不变。
+  const savedProvider = useAppStore((state) => state.providers.find((item) => item.id === initial?.id));
   const form = useForm<ProviderDraft>({
     defaultValues: {
       id: initial?.id,
@@ -279,6 +283,15 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
     try { await reprobeModelReasoning(initial.id, activeModelId); }
     finally { setReprobingReasoning(false); }
   };
+  // 验证需要一个已入库的 provider：后端 command 按 id 查 StateStore 并读取凭据，
+  // 新建流程还没有 id，所以那时不传 onVerify，整个验证区不渲染。
+  const verifyReasoning = async (tier: ReasoningTier) => {
+    if (!initial?.id || !activeModelId) return;
+    setVerifyingReasoning(true);
+    try { await verifyModelReasoning(initial.id, activeModelId, tier); }
+    catch { /* store 已经把错误放进全局 toast，这里只负责收尾 loading。 */ }
+    finally { setVerifyingReasoning(false); }
+  };
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -368,6 +381,9 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
                   onChange={changeReasoning}
                   onReprobe={initial?.id ? () => void reprobeReasoning() : undefined}
                   reprobing={reprobingReasoning}
+                  verifications={savedProvider?.reasoningVerifications}
+                  onVerify={initial?.id ? (tier) => void verifyReasoning(tier) : undefined}
+                  verifying={verifyingReasoning}
                 />
               )}
               {probeResult?.reasoningNote && <small className="reasoning-note">{probeResult.reasoningNote}</small>}
