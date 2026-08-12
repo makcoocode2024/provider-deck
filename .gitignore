@@ -17,4 +17,5 @@ src-tauri/target/
 .codex-catalog-probe-*/
 artifacts/
 release/
+build-output/
 发布包/
