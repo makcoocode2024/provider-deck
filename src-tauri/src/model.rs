@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::reasoning_capability::ReasoningCapability;
+use crate::reasoning_selection::ReasoningSelection;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -103,6 +106,13 @@ pub struct Provider {
     pub codex_probe_model: Option<String>,
     #[serde(default)]
     pub codex_probe_detail: Option<String>,
+    /// 用户对本 Provider 各模型的推理档位选择。
+    ///
+    /// 挂在 Provider 而不是 ModelInfo：models 在 save/reprobe/refresh 三处都是整体替换，
+    /// 把用户意图放进去每次刷新都要靠迁移逻辑救一次。挂这里只需按 model_id 剪枝。
+    /// 同时守住"ModelInfo 装发现到的事实，Provider 装用户的意图"这条边界。
+    #[serde(default)]
+    pub reasoning_selections: Vec<ReasoningSelection>,
     pub models: Vec<ModelInfo>,
     pub connection_state: String,
     pub confidence: Option<f64>,
@@ -129,6 +139,10 @@ pub struct ProviderDraft {
     pub claude_extended_context: bool,
     #[serde(default)]
     pub claude_model_mappings: ClaudeModelMappings,
+    /// 前端提交的推理档位选择。可以只带当前正在编辑的模型，
+    /// 合并时草稿优先、未提到的模型保留原值（见 reasoning_selection::merge_drafted）。
+    #[serde(default)]
+    pub reasoning_selections: Vec<ReasoningSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

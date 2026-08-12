@@ -13,6 +13,7 @@ mod reasoning;
 mod reasoning_capability;
 mod reasoning_adapters;
 mod reasoning_discovery;
+mod reasoning_selection;
 mod storage;
 
 use std::collections::HashMap;
@@ -59,8 +60,11 @@ async fn save_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy
     credentials::set(&id, &resolved_draft.api_key)?;
     let settings = store.read().settings;
     // 回灌已存的推理能力，作为发现流程的缓存输入：未过期就不会再发请求。
+    // 用探测归一化后的 base_url 判定归属——拿用户原始输入去比会让每次保存都失配，
+    // 把一个正确性问题换成"每次保存重发一轮 Tier 2 探测"的成本问题。
     if let Some(stored) = store.read().providers.iter().find(|provider| provider.id == id) {
-        carry_reasoning_forward(&mut probe.models, &stored.models);
+        let target_base_url = probe.normalized_base_url.clone();
+        carry_reasoning_forward(&mut probe.models, &stored.models, &target_base_url);
     }
     protocol::refresh_selected_capabilities(&resolved_draft, &settings, &mut probe).await;
     let provider = store.update(|state| {
@@ -78,6 +82,14 @@ async fn save_provider(store: State<'_, StateStore>, proxy: State<'_, LocalProxy
             codex_compatibility: probe.codex_compatibility.clone(),
             codex_probe_model: probe.codex_probe_model.clone(),
             codex_probe_detail: probe.codex_probe_detail.clone(),
+            // 草稿优先、草稿未提到的模型保留原值，最后剪掉已消失的模型。
+            // 前端只提交正在编辑的那一个模型时，其他模型的选择不能被清掉。
+            reasoning_selections: {
+                let existing = existing.as_ref().map(|p| p.reasoning_selections.as_slice()).unwrap_or(&[]);
+                let mut merged = reasoning_selection::merge_drafted(existing, &resolved_draft.reasoning_selections);
+                reasoning_selection::prune_missing(&mut merged, &probe.models);
+                merged
+            },
             models: probe.models.clone(), connection_state: "connected".into(), confidence: Some(probe.confidence),
             last_checked_at: Some(Utc::now().to_rfc3339()), applied_clients: existing.map(|p| p.applied_clients).unwrap_or_default(), error_summary: None,
         };
@@ -148,6 +160,8 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
         claude_model_profile: provider.claude_model_profile.clone(),
         claude_extended_context: provider.claude_extended_context,
         claude_model_mappings: provider.claude_model_mappings.clone(),
+        // 重探测不改用户意图：选择由 store 里的那份权威，这里不回灌也不覆盖。
+        reasoning_selections: Vec::new(),
     };
 
     match protocol::probe(&draft, &settings).await {
@@ -156,10 +170,13 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
                 let refreshed = {
                     let saved = state.providers.iter_mut().find(|item| item.id == id)
                         .ok_or_else(|| AppError::ProviderNotFound(id.clone()))?;
-                    saved.base_url = probe.normalized_base_url;
+                    // 先接住归一化后的 base_url：能力迁移必须按**新**端点判定，
+                    // 单独存一份避免依赖赋值语句的先后顺序。
+                    let normalized_base_url = probe.normalized_base_url;
+                    saved.base_url = normalized_base_url.clone();
                     saved.protocol = probe.protocol;
                     let mut models = probe.models;
-                    carry_reasoning_forward(&mut models, &saved.models);
+                    carry_reasoning_forward(&mut models, &saved.models, &normalized_base_url);
                     saved.models = models;
                     saved.codex_compatibility = probe.codex_compatibility;
                     saved.codex_probe_model = probe.codex_probe_model;
@@ -168,6 +185,9 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
                     saved.claude_model_mappings.sonnet = saved.claude_model_mappings.sonnet.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
                     saved.claude_model_mappings.opus = saved.claude_model_mappings.opus.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
                     saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                    // 只剪掉真的消失了的模型：换端点不影响"用户想要什么档位"。
+                    let models_snapshot = saved.models.clone();
+                    reasoning_selection::prune_missing(&mut saved.reasoning_selections, &models_snapshot);
                     saved.connection_state = "connected".into();
                     saved.confidence = Some(probe.confidence);
                     saved.last_checked_at = Some(Utc::now().to_rfc3339());
@@ -205,13 +225,24 @@ async fn reprobe_provider(store: State<'_, StateStore>, proxy: State<'_, LocalPr
 /// 不迁移的话每次刷新都会清空能力缓存：Unknown 的 6 小时退避窗口归零，用户点一次
 /// "获取模型"就会在下次保存时重发一轮 Tier 2 探测。
 ///
-/// 能力归属 (base_url, model_id)，换了 base_url 的旧能力会被编排器按 key 拒绝，
-/// 所以这里只按 model_id 对齐即可，不需要额外校验。
-fn carry_reasoning_forward(fresh: &mut [model::ModelInfo], previous: &[model::ModelInfo]) {
+/// 能力归属 `(base_url, model_id)`，所以按 model_id 对齐**不够**：同一个 model_id 在
+/// 不同端点上是不同的部署，档位、预算上限、甚至支持与否都可能不一样。这里必须拿
+/// `target_base_url`（探测归一化后的值，不是用户原始输入）过一遍
+/// [`ReasoningKey::matches`]，失配就整条丢弃——capability / confidence / evidence
+/// 同生同死，不做部分迁移：留下证据却换掉端点，等于用旧证据为新端点背书。
+///
+/// 丢弃是安全的：`reasoning: None` 进入发现流程就是 `cached: None`，TTL 短路不成立，
+/// 会走一次完整发现，代价是一轮探测而不是一个错误的结论。
+///
+/// 与之对应，`Provider.reasoning_selections` 跨端点保留，见
+/// [`reasoning_selection::prune_missing`]：能力是事实，选择是意图。
+fn carry_reasoning_forward(fresh: &mut [model::ModelInfo], previous: &[model::ModelInfo], target_base_url: &str) {
     for model in fresh.iter_mut() {
         if model.reasoning.is_some() { continue; }
-        if let Some(existing) = previous.iter().find(|item| item.id == model.id) {
-            model.reasoning = existing.reasoning.clone();
+        let Some(existing) = previous.iter().find(|item| item.id == model.id) else { continue };
+        let Some(capability) = existing.reasoning.as_ref() else { continue };
+        if capability.key.matches(target_base_url, &model.id) {
+            model.reasoning = Some(capability.clone());
         }
     }
 }
@@ -229,7 +260,74 @@ fn provider_draft(provider: &Provider, api_key: String, settings: &AppSettings) 
         claude_model_profile: provider.claude_model_profile.clone(),
         claude_extended_context: provider.claude_extended_context,
         claude_model_mappings: provider.claude_model_mappings.clone(),
+        reasoning_selections: provider.reasoning_selections.clone(),
     }
+}
+
+/// 对**单个**模型重新发现推理能力。
+///
+/// 保存时的自动 discovery 只覆盖默认模型（一次探测的代价换一个结论），其余模型停留在
+/// "未探明"。这个命令是用户主动为某个模型付这份代价的入口，不做批量：20 个模型的批量
+/// 发现是 20~60 个请求，还会把限流失败当成结论写进 TTL 窗口。
+///
+/// 实现上不新增发现逻辑，而是喂给现有编排器一个合成的 `ProbeResult`：
+/// - `models` 只放目标模型，且 `reasoning` 清空 —— `cached: None`，TTL 短路不成立，强制重新发现
+/// - `default_model` 指向目标模型 —— 编排器选中的就是它
+/// - `codex_probe_model` 预置为目标模型 —— 命中 `run_codex_probe` 的早退，不会重跑 Codex 探测
+///   也不会覆盖已存的兼容性结论
+#[tauri::command]
+async fn reprobe_model_reasoning(store: State<'_, StateStore>, provider_id: String, model_id: String) -> AppResult<Provider> {
+    let state = store.read();
+    let provider = state.providers.iter().find(|provider| provider.id == provider_id).cloned()
+        .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+    let settings = state.settings.clone();
+    let mut target = provider.models.iter().find(|model| model.id == model_id).cloned()
+        .ok_or_else(|| AppError::InvalidInput(format!("Provider 下没有模型 {model_id}")))?;
+    target.reasoning = None;
+
+    let api_key = credentials::get(&provider.id)?;
+    let mut draft = provider_draft(&provider, api_key, &settings);
+    draft.default_model = Some(model_id.clone());
+
+    let mut probe = ProbeResult {
+        normalized_base_url: provider.base_url.clone(),
+        protocol: provider.protocol,
+        confidence: provider.confidence.unwrap_or(0.0),
+        models: vec![target],
+        codex_compatibility: provider.codex_compatibility.clone(),
+        codex_probe_model: Some(model_id.clone()),
+        codex_probe_detail: provider.codex_probe_detail.clone(),
+        checked_endpoints: Vec::new(),
+        user_message: String::new(),
+        technical_detail: None,
+        reasoning_note: None,
+    };
+    protocol::refresh_selected_capabilities(&draft, &settings, &mut probe).await;
+
+    let discovered = probe.models.into_iter().find(|model| model.id == model_id);
+    let note = probe.reasoning_note.clone();
+    let refreshed = store.update(|state| {
+        let refreshed = {
+            let saved = state.providers.iter_mut().find(|item| item.id == provider_id)
+                .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+            if let Some(discovered) = discovered {
+                // 只回写这一个模型，其余模型的能力与上下文窗口原样不动。
+                if let Some(slot) = saved.models.iter_mut().find(|item| item.id == model_id) {
+                    slot.reasoning = discovered.reasoning;
+                    if discovered.context_window.is_some() { slot.context_window = discovered.context_window; }
+                }
+            }
+            saved.clone()
+        };
+        refresh_current_reasoning(state, false);
+        Ok(refreshed)
+    })?;
+    activity::record(
+        "reasoning_reprobe",
+        &format!("重新探测推理能力：{} / {}{}", refreshed.name, model_id, note.map(|note| format!("（{note}）")).unwrap_or_default()),
+        true,
+    );
+    Ok(refreshed)
 }
 
 #[tauri::command]
@@ -246,7 +344,9 @@ async fn refresh_provider_models(store: State<'_, StateStore>, provider_id: Stri
                 let saved = state.providers.iter_mut().find(|item| item.id == provider_id)
                     .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
                 let mut models = models;
-                carry_reasoning_forward(&mut models, &saved.models);
+                // 这条路径只换模型列表，不动端点，所以目标就是已存的 base_url。
+                let target_base_url = saved.base_url.clone();
+                carry_reasoning_forward(&mut models, &saved.models, &target_base_url);
                 saved.models = models;
                 saved.default_model = saved.default_model.clone()
                     .filter(|model| saved.models.iter().any(|item| &item.id == model))
@@ -254,6 +354,8 @@ async fn refresh_provider_models(store: State<'_, StateStore>, provider_id: Stri
                 saved.claude_model_mappings.sonnet = saved.claude_model_mappings.sonnet.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
                 saved.claude_model_mappings.opus = saved.claude_model_mappings.opus.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
                 saved.claude_model_mappings.haiku = saved.claude_model_mappings.haiku.clone().filter(|model| saved.models.iter().any(|item| &item.id == model));
+                let models_snapshot = saved.models.clone();
+                reasoning_selection::prune_missing(&mut saved.reasoning_selections, &models_snapshot);
                 saved.connection_state = "connected".into();
                 saved.confidence = Some(confidence);
                 saved.last_checked_at = Some(Utc::now().to_rfc3339());
@@ -470,7 +572,7 @@ pub fn run() {
     })
     .manage(store).manage(proxy).manage(chats).invoke_handler(tauri::generate_handler![
         list_providers, get_provider_api_key, save_provider, delete_provider, set_current_provider, probe_provider, reprobe_provider, detect_clients,
-        refresh_provider_models, test_provider,
+        refresh_provider_models, reprobe_model_reasoning, test_provider,
         preview_changes, apply_changes, list_backups, restore_backup, get_settings, save_settings,
         list_chat_backups, chat_cache_summary, export_chat_backup, restore_chat_backup_file, restore_chat_backup_payload, restore_chat_cache, rollback_chat_restore,
         export_providers, import_providers, diagnostics
@@ -515,11 +617,72 @@ mod tests {
         // 刷新拿到的新列表：能力字段一律为空，且模型集合有增有减。
         let mut fresh = vec![model("gpt-x", None), model("gpt-z", None)];
 
-        carry_reasoning_forward(&mut fresh, &previous);
+        carry_reasoning_forward(&mut fresh, &previous, "https://api.example.com/v1");
 
         assert!(fresh[0].reasoning.is_some(), "已发现的能力在刷新后丢失");
         assert_eq!(fresh[0].reasoning.as_ref().unwrap().tiers.len(), 2);
         assert!(fresh[1].reasoning.is_none(), "新模型不应继承其他模型的能力");
+    }
+
+    /// P0-1：换 base_url 后旧能力不得被迁移到新列表。
+    ///
+    /// 迁移按 model_id 对齐，但能力归属 (base_url, model_id)。编排器只对"被选中的
+    /// 那一个模型"跑发现，其余模型不会经过 key 校验——旧键就这样留在了新 Provider 上，
+    /// 前端拿到的是属于另一个 base_url 的档位表。
+    #[test]
+    fn reasoning_does_not_carry_across_base_urls() {
+        let previous = vec![model("gpt-x", Some(capability("https://old.example.com/v1", "gpt-x")))];
+        let mut fresh = vec![model("gpt-x", None)];
+        carry_reasoning_forward(&mut fresh, &previous, "https://new.example.com/v1");
+        let carried = fresh[0].reasoning.as_ref().map(|item| item.key.base_url.clone());
+        assert_eq!(carried, None, "跨 base_url 迁移了旧能力，实际带过来的键是 {carried:?}");
+    }
+
+    /// P0-1 的反向约束：同端点必须照常继承。
+    ///
+    /// 把 key 校验写成"一律不继承"也能让上一个测试变绿，但那样每次刷新都清空缓存，
+    /// 等于把正确性问题换成"每次保存重发一轮 Tier 2 探测"的成本问题。
+    #[test]
+    fn same_base_url_still_inherits_capability() {
+        let previous = vec![model("gpt-x", Some(capability("https://api.example.com/v1", "gpt-x")))];
+        let mut fresh = vec![model("gpt-x", None)];
+        carry_reasoning_forward(&mut fresh, &previous, "https://api.example.com/v1");
+        assert!(fresh[0].reasoning.is_some(), "同端点的能力缓存被误删，会导致每次刷新都重探");
+    }
+
+    /// 迁移必须拿**归一化后**的 base_url 判定。
+    ///
+    /// 能力键里存的是 `normalized_base_url`；若调用方传用户原始输入（尾斜杠、缺 /v1、
+    /// 大小写），每次保存都会失配，缓存永远命中不了。
+    #[test]
+    fn migration_judges_against_normalized_base_url() {
+        let previous = vec![model("gpt-x", Some(capability("https://api.example.com/v1", "gpt-x")))];
+
+        let mut fresh = vec![model("gpt-x", None)];
+        carry_reasoning_forward(&mut fresh, &previous, "https://api.example.com/v1/");
+        assert!(fresh[0].reasoning.is_none(), "带尾斜杠的原始输入不应被当成同一端点");
+
+        let mut fresh = vec![model("gpt-x", None)];
+        carry_reasoning_forward(&mut fresh, &previous, "https://api.example.com/v1");
+        assert!(fresh[0].reasoning.is_some(), "归一化后的值必须命中缓存");
+    }
+
+    /// capability / confidence / evidence 三者同生同死，不做部分迁移。
+    #[test]
+    fn foreign_capability_is_discarded_whole() {
+        let mut stale = capability("https://old.example.com/v1", "gpt-x");
+        stale.confidence = ReasoningConfidence::Verified;
+        stale.push_evidence(crate::reasoning_capability::ReasoningEvidence::new(
+            crate::reasoning_capability::EvidenceSource::CapabilityValidation,
+            Some("https://old.example.com/v1/chat/completions".into()),
+            "旧端点上确证过",
+        ));
+        let previous = vec![model("gpt-x", Some(stale))];
+        let mut fresh = vec![model("gpt-x", None)];
+
+        carry_reasoning_forward(&mut fresh, &previous, "https://new.example.com/v1");
+
+        assert!(fresh[0].reasoning.is_none(), "留下 evidence 却换掉端点，等于用旧证据为新端点背书");
     }
 
     /// 探测本轮已产出的能力优先，不被旧缓存覆盖。
@@ -530,8 +693,52 @@ mod tests {
         discovered.confidence = ReasoningConfidence::Validated;
         let mut fresh = vec![model("gpt-x", Some(discovered))];
 
-        carry_reasoning_forward(&mut fresh, &previous);
+        carry_reasoning_forward(&mut fresh, &previous, "https://api.example.com/v1");
 
         assert_eq!(fresh[0].reasoning.as_ref().unwrap().confidence, ReasoningConfidence::Validated);
+    }
+
+    /// 用户选择跨端点保留，只按 model_id 剪枝。
+    ///
+    /// 与上面 capability 的严格 key 校验刻意不对称：能力是事实（换端点即失效），
+    /// 选择是意图（换端点依然成立）。
+    #[test]
+    fn selections_survive_base_url_change_but_drop_vanished_models() {
+        use crate::reasoning_capability::ReasoningTier;
+        use crate::reasoning_selection::{prune_missing, ReasoningSelection, SelectionSource};
+
+        let mut selections = vec![
+            ReasoningSelection::new("gpt-x", ReasoningTier::Deep, SelectionSource::User),
+            ReasoningSelection::new("gpt-gone", ReasoningTier::Light, SelectionSource::User),
+        ];
+        // 新端点、新模型列表：gpt-x 还在，gpt-gone 消失了。
+        let models = vec![model("gpt-x", None), model("gpt-new", None)];
+
+        prune_missing(&mut selections, &models);
+
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].model_id, "gpt-x");
+        assert_eq!(selections[0].tier, Some(ReasoningTier::Deep), "换端点不应改变用户意图");
+    }
+
+    /// 保存时草稿只提交正在编辑的那个模型，其他模型的选择不能被清掉。
+    #[test]
+    fn saving_one_model_keeps_other_selections() {
+        use crate::reasoning_capability::ReasoningTier;
+        use crate::reasoning_selection::{merge_drafted, prune_missing, ReasoningSelection, SelectionSource};
+
+        let existing = vec![
+            ReasoningSelection::new("gpt-x", ReasoningTier::Light, SelectionSource::User),
+            ReasoningSelection::new("gpt-y", ReasoningTier::Deep, SelectionSource::User),
+        ];
+        let drafted = vec![ReasoningSelection::new("gpt-x", ReasoningTier::Max, SelectionSource::User)];
+
+        let mut merged = merge_drafted(&existing, &drafted);
+        prune_missing(&mut merged, &[model("gpt-x", None), model("gpt-y", None)]);
+
+        assert_eq!(merged.len(), 2, "草稿未提到的模型被误删");
+        let tier_of = |id: &str| merged.iter().find(|item| item.model_id == id).and_then(|item| item.tier);
+        assert_eq!(tier_of("gpt-x"), Some(ReasoningTier::Max), "草稿应覆盖同模型的旧选择");
+        assert_eq!(tier_of("gpt-y"), Some(ReasoningTier::Deep));
     }
 }

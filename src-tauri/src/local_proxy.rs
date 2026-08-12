@@ -30,7 +30,10 @@ struct ProxyRoute {
     api_key: String,
     local_token: String,
     client: Client,
-    reasoning_effort: String,
+    #[allow(dead_code)]
+    provider_id: String,
+    models: Vec<crate::model::ModelInfo>,
+    reasoning_selections: Vec<crate::reasoning_selection::ReasoningSelection>,
 }
 
 struct ProxyState {
@@ -85,7 +88,9 @@ impl LocalProxy {
             api_key: api_key.to_string(),
             local_token: local_token.to_string(),
             client: builder.build().map_err(|error| AppError::Network(error.to_string()))?,
-            reasoning_effort: settings.effective_reasoning_level.as_str().into(),
+            provider_id: provider.id.clone(),
+            models: provider.models.clone(),
+            reasoning_selections: provider.reasoning_selections.clone(),
         };
         self.state.routes.write().map_err(|_| AppError::Config("本地代理路由锁已损坏".into()))?.insert(provider.id.clone(), route);
         Ok(())
@@ -123,7 +128,7 @@ async fn handle_responses(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(provider_id): Path<String>,
     headers: HeaderMap,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> Response<Body> {
     if !peer.ip().is_loopback() { return json_error(StatusCode::FORBIDDEN, "本地代理只接受环回连接"); }
     let route = match state.routes.read().ok().and_then(|routes| routes.get(&provider_id).cloned()) {
@@ -132,20 +137,41 @@ async fn handle_responses(
     };
     if bearer(&headers) != Some(route.local_token.as_str()) { return json_error(StatusCode::UNAUTHORIZED, "本地代理令牌无效"); }
 
-    if let Some(object) = payload.as_object_mut() {
-        let reasoning = object.entry("reasoning").or_insert_with(|| json!({}));
-        if let Some(reasoning) = reasoning.as_object_mut() {
-            reasoning.insert("effort".into(), Value::String(route.reasoning_effort.clone()));
-        }
-    }
     let previous_messages = payload.get("previous_response_id").and_then(Value::as_str).and_then(|id| state.chats.get(id));
     if payload.get("previous_response_id").is_some() && previous_messages.is_none() {
         return json_error(StatusCode::CONFLICT, "previous_response_id 不属于当前代理进程；请开启新会话");
     }
-    let converted = match responses_to_chat(&payload, previous_messages.as_deref()) {
+    let mut converted = match responses_to_chat(&payload, previous_messages.as_deref()) {
         Ok(converted) => converted,
         Err(error) => return json_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
     };
+
+    // 按请求中的 model 动态解析 reasoning：不再使用冻结的全局 reasoning_effort
+    let model_id = payload.get("model").and_then(Value::as_str).unwrap_or("");
+    if !model_id.is_empty() {
+        if let Some(model) = route.models.iter().find(|m| m.id == model_id) {
+            if let Some(capability) = &model.reasoning {
+                let selection = route.reasoning_selections.iter().find(|sel| sel.model_id == model_id);
+                let resolved = crate::reasoning_selection::resolve_binding(Some(capability), selection, None);
+                if !resolved.is_omitted() {
+                    let protocol = model.protocol;
+                    let adapter = crate::reasoning_adapters::adapter_for(protocol);
+                    if let Some(tier) = resolved.tier {
+                        if let Some(reasoning_config) = adapter.apply_reasoning_config(capability, tier) {
+                            if let Some(object) = converted.body.as_object_mut() {
+                                if let Some(reasoning_fields) = reasoning_config.as_object() {
+                                    for (key, value) in reasoning_fields {
+                                        object.insert(key.clone(), value.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let chat_messages = converted.body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
     let upstream = match route.client.post(&route.upstream_endpoint)
         .bearer_auth(&route.api_key)
@@ -263,6 +289,7 @@ mod tests {
             claude_extended_context: false, claude_model_mappings: Default::default(),
             codex_compatibility: crate::model::CodexCompatibility::ChatProxy,
             codex_probe_model: Some("dynamic-model".into()), codex_probe_detail: None,
+            reasoning_selections: vec![],
             models: vec![], connection_state: "connected".into(), confidence: Some(1.0),
             last_checked_at: None, applied_clients: vec![], error_summary: None,
         }
@@ -370,5 +397,216 @@ mod tests {
         assert!(body.contains("event: response.output_text.delta"));
         assert!(body.contains("event: response.completed"));
         server.join().unwrap();
+    }
+
+    fn test_model(id: &str, reasoning: Option<crate::reasoning_capability::ReasoningCapability>) -> crate::model::ModelInfo {
+        crate::model::ModelInfo {
+            id: id.into(),
+            display_name: id.into(),
+            provider: None,
+            protocol: crate::model::ProtocolKind::Openai,
+            source: "test".into(),
+            capabilities: vec![],
+            context_window: Some(128_000),
+            parameter_count_billions: None,
+            reasoning,
+        }
+    }
+
+    fn effort_capability(model_id: &str) -> crate::reasoning_capability::ReasoningCapability {
+        use crate::reasoning_capability::{ReasoningBinding, ReasoningCapability, ReasoningConfidence, ReasoningKey, ReasoningTier, ReasoningTierOption};
+        let key = ReasoningKey::new("https://api.example.com/v1", model_id);
+        let mut cap = ReasoningCapability::from_effort_enum(
+            key,
+            &["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            ReasoningConfidence::Validated,
+        );
+        cap.tiers = vec![
+            ReasoningTierOption {
+                tier: ReasoningTier::Light,
+                id: "light".into(),
+                label: "轻度推理".into(),
+                binding: ReasoningBinding::Effort { value: "low".into() },
+                wire_summary: "reasoning.effort = low".into(),
+            },
+            ReasoningTierOption {
+                tier: ReasoningTier::Standard,
+                id: "standard".into(),
+                label: "中度推理".into(),
+                binding: ReasoningBinding::Effort { value: "medium".into() },
+                wire_summary: "reasoning.effort = medium".into(),
+            },
+            ReasoningTierOption {
+                tier: ReasoningTier::Deep,
+                id: "deep".into(),
+                label: "高度推理".into(),
+                binding: ReasoningBinding::Effort { value: "high".into() },
+                wire_summary: "reasoning.effort = high".into(),
+            },
+            ReasoningTierOption {
+                tier: ReasoningTier::Max,
+                id: "max".into(),
+                label: "超高推理".into(),
+                binding: ReasoningBinding::Effort { value: "xhigh".into() },
+                wire_summary: "reasoning.effort = xhigh".into(),
+            },
+        ];
+        cap
+    }
+
+    #[tokio::test]
+    async fn proxy_uses_model_specific_reasoning_selection() {
+        use crate::reasoning_selection::{ReasoningSelection, SelectionSource};
+        use crate::reasoning_capability::ReasoningTier;
+
+        let (upstream_base, server) = spawn_upstream(200, r#"{"id":"chatcmpl-test","model":"model-a","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#);
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
+        let mut provider = test_provider(upstream_base.clone());
+        provider.models = vec![
+            test_model("model-a", Some(effort_capability("model-a"))),
+            test_model("model-b", Some(effort_capability("model-b"))),
+        ];
+        provider.reasoning_selections = vec![
+            ReasoningSelection::new("model-a", ReasoningTier::Deep, SelectionSource::User),
+            ReasoningSelection::new("model-b", ReasoningTier::Light, SelectionSource::User),
+        ];
+        proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
+
+        let client = Client::new();
+        let response = client.post(format!("{}/responses", proxy.provider_base_url(&provider.id)))
+            .bearer_auth("local-secret")
+            .json(&json!({ "model": "model-a", "input": "test" }))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_request = server.join().unwrap();
+        let body_start = upstream_request.find("\r\n\r\n").unwrap() + 4;
+        let body: Value = serde_json::from_str(&upstream_request[body_start..]).unwrap();
+        assert_eq!(body.pointer("/reasoning/effort").and_then(Value::as_str), Some("high"), "model-a 应注入 high");
+    }
+
+    #[tokio::test]
+    async fn proxy_does_not_use_global_reasoning_level() {
+        use crate::reasoning_selection::{ReasoningSelection, SelectionSource};
+        use crate::reasoning_capability::ReasoningTier;
+        use crate::model::ReasoningLevel;
+
+        let (upstream_base, server) = spawn_upstream(200, r#"{"id":"chatcmpl-test","model":"model-a","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#);
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
+        let mut provider = test_provider(upstream_base);
+        provider.models = vec![test_model("model-a", Some(effort_capability("model-a")))];
+        provider.reasoning_selections = vec![
+            ReasoningSelection::new("model-a", ReasoningTier::Light, SelectionSource::User),
+        ];
+        let settings = AppSettings {
+            manual_reasoning_level: ReasoningLevel::High,
+            ..Default::default()
+        };
+        proxy.register(&provider, "upstream-secret", "local-secret", &settings).unwrap();
+
+        let client = Client::new();
+        let response = client.post(format!("{}/responses", proxy.provider_base_url(&provider.id)))
+            .bearer_auth("local-secret")
+            .json(&json!({ "model": "model-a", "input": "test" }))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_request = server.join().unwrap();
+        let body_start = upstream_request.find("\r\n\r\n").unwrap() + 4;
+        let body: Value = serde_json::from_str(&upstream_request[body_start..]).unwrap();
+        assert_eq!(body.pointer("/reasoning/effort").and_then(Value::as_str), Some("low"), "用户选择优先于全局档位");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_does_not_inject_reasoning() {
+        let (upstream_base, server) = spawn_upstream(200, r#"{"id":"chatcmpl-test","model":"unknown-model","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#);
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
+        let provider = test_provider(upstream_base);
+        proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
+
+        let client = Client::new();
+        let response = client.post(format!("{}/responses", proxy.provider_base_url(&provider.id)))
+            .bearer_auth("local-secret")
+            .json(&json!({ "model": "unknown-model", "input": "test" }))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = server.join().unwrap();
+        assert!(!request.contains("\"reasoning\""), "未知模型不应注入 reasoning 字段");
+    }
+
+    #[tokio::test]
+    async fn xhigh_is_not_downgraded() {
+        use crate::reasoning_selection::{ReasoningSelection, SelectionSource};
+        use crate::reasoning_capability::ReasoningTier;
+
+        let (upstream_base, server) = spawn_upstream(200, r#"{"id":"chatcmpl-test","model":"model-a","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#);
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
+        let mut provider = test_provider(upstream_base);
+        provider.models = vec![test_model("model-a", Some(effort_capability("model-a")))];
+        provider.reasoning_selections = vec![
+            ReasoningSelection::new("model-a", ReasoningTier::Max, SelectionSource::User),
+        ];
+        proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
+
+        let client = Client::new();
+        let response = client.post(format!("{}/responses", proxy.provider_base_url(&provider.id)))
+            .bearer_auth("local-secret")
+            .json(&json!({ "model": "model-a", "input": "test" }))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_request = server.join().unwrap();
+        let body_start = upstream_request.find("\r\n\r\n").unwrap() + 4;
+        let body: Value = serde_json::from_str(&upstream_request[body_start..]).unwrap();
+        assert_eq!(body.pointer("/reasoning/effort").and_then(Value::as_str), Some("xhigh"), "xhigh 不应被降级");
+    }
+
+    #[tokio::test]
+    async fn budget_binding_generates_native_format() {
+        use crate::reasoning_selection::{ReasoningSelection, SelectionSource};
+        use crate::reasoning_capability::{ReasoningBinding, ReasoningCapability, ReasoningConfidence, ReasoningKey, ReasoningTier, ReasoningTierOption};
+
+        let (upstream_base, server) = spawn_upstream(200, r#"{"id":"chatcmpl-test","model":"gemini-2.0-flash-thinking","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#);
+        let proxy = LocalProxy::start(None, ChatStore::load().unwrap()).unwrap();
+
+        // 构造 Gemini 风格的 Budget 能力（使用 thought_generation_config.thought_budget）
+        let key = ReasoningKey::new("https://api.example.com", "gemini-2.0-flash-thinking");
+        let mut capability = ReasoningCapability::from_token_budget(key, 0, 10000, false, None, ReasoningConfidence::Validated);
+        capability.tiers = vec![
+            ReasoningTierOption {
+                tier: ReasoningTier::Light,
+                id: "light".into(),
+                label: "轻度推理".into(),
+                binding: ReasoningBinding::Budget { tokens: 1024 },
+                wire_summary: "thought_generation_config.thought_budget = 1024".into(),
+            },
+            ReasoningTierOption {
+                tier: ReasoningTier::Deep,
+                id: "deep".into(),
+                label: "深度推理".into(),
+                binding: ReasoningBinding::Budget { tokens: 8192 },
+                wire_summary: "thought_generation_config.thought_budget = 8192".into(),
+            },
+        ];
+
+        let mut provider = test_provider(upstream_base);
+        provider.protocol = crate::model::ProtocolKind::Gemini;
+        provider.models = vec![{
+            let mut model = test_model("gemini-2.0-flash-thinking", Some(capability));
+            model.protocol = crate::model::ProtocolKind::Gemini;
+            model
+        }];
+        provider.reasoning_selections = vec![
+            ReasoningSelection::new("gemini-2.0-flash-thinking", ReasoningTier::Deep, SelectionSource::User),
+        ];
+        proxy.register(&provider, "upstream-secret", "local-secret", &AppSettings::default()).unwrap();
+
+        let client = Client::new();
+        let response = client.post(format!("{}/responses", proxy.provider_base_url(&provider.id)))
+            .bearer_auth("local-secret")
+            .json(&json!({ "model": "gemini-2.0-flash-thinking", "input": "test" }))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream_request = server.join().unwrap();
+        let body_start = upstream_request.find("\r\n\r\n").unwrap() + 4;
+        let body: Value = serde_json::from_str(&upstream_request[body_start..]).unwrap();
+        assert_eq!(body.pointer("/generationConfig/thinkingConfig/thinkingBudget").and_then(Value::as_u64), Some(8192), "应注入 thinkingBudget = 8192");
     }
 }

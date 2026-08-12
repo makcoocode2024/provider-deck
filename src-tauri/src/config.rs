@@ -7,6 +7,133 @@ use toml_edit::{value, DocumentMut, Item, Table};
 use url::Url;
 use uuid::Uuid;
 use crate::{clients, error::{AppError, AppResult}, model::{AppSettings, BackupRecord, ClaudeModelMappings, ClaudeModelProfile, CodexCompatibility, ConfigChange, ProtocolKind, Provider}, storage::atomic_replace};
+use crate::reasoning_adapters::adapter_for;
+use crate::reasoning_capability::{ReasoningBinding, ReasoningCapability, ReasoningControl, ReasoningSupport};
+use crate::reasoning_selection;
+
+/// Codex 能表达的推理配置。
+///
+/// `config.toml` 的 `model_reasoning_effort` 只是一个字符串，而 Adapter 产出的是协议原生
+/// JSON——OpenAI 是 `{"reasoning":{"effort":"medium"}}`，Anthropic 是
+/// `{"thinking":{"budget_tokens":8192}}`，Gemini 是 `{"generationConfig":{...}}`。
+/// 后两者在 Codex 里根本无处安放，所以这一层只做一件事：把能落进那个字符串的取出来，
+/// 落不进的**省略**并留下原因，绝不把 8192 硬塞成 `model_reasoning_effort = "8192"`。
+#[derive(Debug, Default, Clone)]
+struct CodexReasoning {
+    /// 写进 `model_reasoning_effort` / `default_reasoning_level` 的取值。
+    effort: Option<String>,
+    /// 写进 `supported_reasoning_levels` 的 (effort, description) 列表，
+    /// 全部由 `capability.control` 派生，没有任何内置档位表。
+    supported: Vec<(String, String)>,
+    /// 中文说明，用于 preview 警告与调试。
+    reason: String,
+}
+
+impl CodexReasoning {
+    /// 该模型没有任何可写的推理信息：catalog 里连 reasoning 相关键都不出现。
+    fn is_empty(&self) -> bool {
+        self.effort.is_none() && self.supported.is_empty()
+    }
+}
+
+/// `(Provider, model_id)` → Codex 可写的推理配置。
+///
+/// 链路：`ModelInfo.reasoning` + `Provider.reasoning_selections` →
+/// [`reasoning_selection::resolve_binding`] → [`ReasoningAdapter::apply_reasoning_config`] →
+/// 本函数抽取 Codex 字段。旧的全局 `effective_reasoning_level` 只作为 legacy fallback
+/// 传给 resolver，不再是主来源。
+fn codex_reasoning(provider: &Provider, model_id: &str, settings: &AppSettings) -> CodexReasoning {
+    let capability = provider.models.iter()
+        .find(|item| item.id == model_id)
+        .and_then(|item| item.reasoning.as_ref());
+    let selection = reasoning_selection::selection_for(&provider.reasoning_selections, model_id);
+    let resolved = reasoning_selection::resolve_binding(
+        capability,
+        selection,
+        Some(settings.effective_reasoning_level),
+    );
+
+    // 档位清单直接来自发现结果。服务端将来新增 xhigh / ultra / 任何新成员，
+    // 这里自动出现，不需要改代码——所以本函数里不允许出现任何档位字面量。
+    let supported = capability
+        .filter(|item| item.support == ReasoningSupport::Supported)
+        .map(declared_effort_levels)
+        .unwrap_or_default();
+
+    // 无证据 ≠ 反证。这两种"省略"必须分开处理：
+    //
+    // - 能力缺失 / Unknown：什么都没探到。resolve_binding 对请求参数返回 Omitted 是对的
+    //   （发一个网关不认的参数会 400），但 config.toml 是用户已经在用的配置文件，
+    //   升级一次版本就把 model_reasoning_effort 抹掉属于让旧配置失效。这里沿用旧的全局
+    //   档位——它不与任何已发现的事实冲突，只是维持现状。
+    // - Unsupported：探到了"不支持"这个事实。此时写任何档位都是已知错误，保持沉默。
+    let legacy_kept = || {
+        let legacy = settings.effective_reasoning_level.as_str().to_owned();
+        CodexReasoning {
+            effort: Some(legacy.clone()),
+            // 没有任何已声明的成员，就不编造清单。Codex 侧表现为该模型不提供档位选择，
+            // 但 model_reasoning_effort 仍然生效。
+            supported: supported.clone(),
+            reason: format!("{}；沿用旧的全局档位 \"{legacy}\" 以保持既有配置不变", resolved.reason),
+        }
+    };
+    let capability = match capability {
+        None => return legacy_kept(),
+        Some(item) if matches!(item.support, ReasoningSupport::Unknown) => return legacy_kept(),
+        Some(item) => item,
+    };
+
+    if resolved.is_omitted() {
+        return CodexReasoning { effort: None, supported, reason: resolved.reason };
+    }
+
+    // 协议原生映射仍然由 Adapter 负责，config.rs 不重新实现一遍。
+    // tier 为 None 只发生在用户钉死了 explicit_binding 的情况，此时绕过档位语义，
+    // 直接读绑定本身。
+    let effort = match resolved.tier {
+        Some(tier) => adapter_for(provider.protocol)
+            .apply_reasoning_config(capability, tier)
+            .as_ref()
+            .and_then(|native| native.pointer("/reasoning/effort"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        None => match &resolved.binding {
+            ReasoningBinding::Effort { value } => Some(value.clone()),
+            _ => None,
+        },
+    };
+
+    // 只接受服务端**声明过**的成员。这不是白名单，而是"取值必须有出处"：
+    // Adapter 会把 Disabled 合成为 effort="off"，而 off 未必是这个网关的合法成员，
+    // 写进 config.toml 会让 Codex 启动即报错。
+    let effort = effort.filter(|value| {
+        matches!(&capability.control, ReasoningControl::EffortEnum { values } if values.iter().any(|member| member == value))
+    });
+
+    let reason = match &effort {
+        Some(value) => format!("{}，写入 model_reasoning_effort = \"{value}\"", resolved.reason),
+        None => format!(
+            "{}；该绑定无法用 Codex 的 model_reasoning_effort 表达，已省略该字段（budget binding cannot be represented by Codex model_reasoning_effort）",
+            resolved.reason
+        ),
+    };
+    CodexReasoning { effort, supported, reason }
+}
+
+/// 由 `capability.control` 派生 Codex 的 `supported_reasoning_levels`。
+///
+/// 描述文本取自档位表里同绑定的那一档标签；`tiers` 是 `control.values` 的策展视图
+/// （成员多于 4 个时只挑代表），落选成员拿不到标签，给一句中性描述而不是编造语义。
+fn declared_effort_levels(capability: &ReasoningCapability) -> Vec<(String, String)> {
+    let ReasoningControl::EffortEnum { values } = &capability.control else { return Vec::new(); };
+    values.iter().map(|value| {
+        let description = capability.tiers.iter()
+            .find(|option| matches!(&option.binding, ReasoningBinding::Effort { value: bound } if bound == value))
+            .map(|option| option.label.clone())
+            .unwrap_or_else(|| format!("服务端声明的推理档位 {value}"));
+        (value.clone(), description)
+    }).collect()
+}
 
 fn slug(provider: &Provider) -> String {
     let filtered: String = provider.name.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
@@ -41,7 +168,12 @@ fn merge_codex(existing: &str, provider: &Provider, secret: &str, settings: &App
         let context_window = provider.models.iter().find(|item| &item.id == model).and_then(|item| item.context_window).unwrap_or(200_000);
         doc["model"] = value(model.clone());
         doc["model_context_window"] = value(context_window as i64);
-        doc["model_reasoning_effort"] = value(settings.effective_reasoning_level.as_str());
+        match codex_reasoning(provider, model, settings).effort {
+            Some(effort) => doc["model_reasoning_effort"] = value(effort),
+            // 主动删除而不是留着：merge 是就地合并，上一次写的旧档位若不删，
+            // 会以一个此模型并不支持的取值继续生效。
+            None => { doc.as_table_mut().remove("model_reasoning_effort"); }
+        }
         doc["model_supports_reasoning_summaries"] = value(false);
         doc["model_reasoning_summary"] = value("none");
     }
@@ -102,13 +234,6 @@ fn codex_catalog(provider: &Provider, settings: &AppSettings) -> AppResult<Strin
             "slug": model.id,
             "display_name": model.display_name,
             "description": format!("{} via Provider Deck", model.display_name),
-            "default_reasoning_level": settings.effective_reasoning_level.as_str(),
-            "supported_reasoning_levels": [
-                { "effort": "minimal", "description": "Fastest responses with minimal reasoning" },
-                { "effort": "low", "description": "Fast responses with lighter reasoning" },
-                { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
-                { "effort": "high", "description": "Greater reasoning depth for complex problems" }
-            ],
             "shell_type": "shell_command",
             "visibility": "list",
             "supported_in_api": true,
@@ -136,6 +261,21 @@ fn codex_catalog(provider: &Provider, settings: &AppSettings) -> AppResult<Strin
         });
         if matches!(provider.codex_compatibility, CodexCompatibility::Full | CodexCompatibility::ChatProxy) {
             entry["apply_patch_tool_type"] = Value::String("freeform".into());
+        }
+        // 推理档位按**模型**逐个解析：同一个 Provider 下 model-a 可以是 high、
+        // model-b 可以完全不支持推理。之前这里对所有模型写同一份全局值 + 同一张硬编码表。
+        let reasoning = codex_reasoning(provider, &model.id, settings);
+        if !reasoning.is_empty() {
+            if let Some(effort) = &reasoning.effort {
+                entry["default_reasoning_level"] = Value::String(effort.clone());
+            }
+            if !reasoning.supported.is_empty() {
+                entry["supported_reasoning_levels"] = Value::Array(
+                    reasoning.supported.iter()
+                        .map(|(effort, description)| json!({ "effort": effort, "description": description }))
+                        .collect(),
+                );
+            }
         }
         entry
     }).collect::<Vec<_>>();
@@ -330,6 +470,11 @@ pub fn preview(provider: &Provider, client_ids: &[String], settings: &AppSetting
                 CodexCompatibility::ResponsesUnsupported => warnings.push("该网关不支持当前 Codex 必需的 Responses 工具协议。官方 Codex 不支持 chat 作为 wire_api，因此不会写入无效配置。".into()),
                 CodexCompatibility::NotApplicable => {}
             }
+            // 推理档位为什么是这个值、或者为什么被省略，都要让用户在预览里看到，
+            // 而不是只留在调试信息里。
+            if let Some(model) = &provider.default_model {
+                warnings.push(format!("推理档位：{}", codex_reasoning(provider, model, settings).reason));
+            }
         }
         if client_id == "opencode" && path.as_ref().is_some_and(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonc")) { warnings.push("JSONC 注释可能无法保留，建议保持只生成模式。".into()); }
         if !can_write { warnings.push(client.guidance.clone()); }
@@ -421,7 +566,7 @@ fn restrict_permissions(_path: &Path) -> AppResult<()> { Ok(()) }
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn provider() -> Provider { Provider { id: "12345678-test".into(), name: "Example".into(), base_url: "https://api.example.com/v1".into(), protocol: ProtocolKind::Openai, enabled: true, is_current: true, default_model: Some("coder".into()), claude_model_profile: None, claude_extended_context: false, claude_model_mappings: ClaudeModelMappings::default(), codex_compatibility: CodexCompatibility::Full, codex_probe_model: Some("coder".into()), codex_probe_detail: None, models: vec![], connection_state: "connected".into(), confidence: Some(0.9), last_checked_at: None, applied_clients: vec![], error_summary: None } }
+    fn provider() -> Provider { Provider { id: "12345678-test".into(), name: "Example".into(), base_url: "https://api.example.com/v1".into(), protocol: ProtocolKind::Openai, enabled: true, is_current: true, default_model: Some("coder".into()), claude_model_profile: None, claude_extended_context: false, claude_model_mappings: ClaudeModelMappings::default(), codex_compatibility: CodexCompatibility::Full, codex_probe_model: Some("coder".into()), codex_probe_detail: None, reasoning_selections: vec![], models: vec![], connection_state: "connected".into(), confidence: Some(0.9), last_checked_at: None, applied_clients: vec![], error_summary: None } }
     #[test]
     fn codex_merge_preserves_unknown_fields() {
         let output = merge_codex("custom_flag = true\n", &provider(), "secret", &AppSettings::default()).unwrap();
@@ -435,8 +580,138 @@ mod tests {
         let catalog: Value = serde_json::from_str(&codex_catalog(&provider(), &AppSettings::default()).unwrap()).unwrap();
         assert_eq!(catalog["models"][0]["slug"], "coder");
         assert_eq!(catalog["models"][0]["default_reasoning_level"], "high");
-        assert_eq!(catalog["models"][0]["supported_reasoning_levels"].as_array().unwrap().len(), 4);
+        // 硬编码的 minimal/low/medium/high 四项清单已删除。这个 Provider 没有任何已发现的
+        // 能力，就没有"服务端声明过的档位"可写——不编造清单，但上面的全局档位仍然保留，
+        // 旧配置不失效。
+        assert!(catalog["models"][0].get("supported_reasoning_levels").is_none());
         assert_eq!(catalog["models"][0]["apply_patch_tool_type"], "freeform");
+    }
+
+    /// 便于测试构造能力：档位成员原样来自入参，模拟服务端声明。
+    fn effort_capability(model_id: &str, values: &[&str]) -> ReasoningCapability {
+        ReasoningCapability::from_effort_enum(
+            crate::reasoning_capability::ReasoningKey::new("https://api.example.com/v1", model_id),
+            &values.iter().map(|value| (*value).to_string()).collect::<Vec<_>>(),
+            crate::reasoning_capability::ReasoningConfidence::Declared,
+        )
+    }
+
+    fn model_with(model_id: &str, reasoning: Option<ReasoningCapability>) -> crate::model::ModelInfo {
+        crate::model::ModelInfo {
+            id: model_id.into(), display_name: model_id.into(), provider: None,
+            protocol: ProtocolKind::Openai, source: "test".into(), capabilities: Vec::new(),
+            context_window: None, parameter_count_billions: None, reasoning,
+        }
+    }
+
+    /// 用户选中的档位必须出现在 config.toml 与 catalog 里。
+    #[test]
+    fn effort_selection_updates_codex_reasoning_effort() {
+        use crate::reasoning_capability::ReasoningTier;
+        use crate::reasoning_selection::{ReasoningSelection, SelectionSource};
+
+        let mut provider = provider();
+        provider.models = vec![model_with("coder", Some(effort_capability("coder", &["low", "medium", "high"])))];
+        // medium 在这张能力表里是 Standard 档。
+        provider.reasoning_selections = vec![ReasoningSelection::new("coder", ReasoningTier::Standard, SelectionSource::User)];
+
+        let settings = AppSettings::default();
+        let document = DocumentMut::from_str(&merge_codex("", &provider, "secret", &settings).unwrap()).unwrap();
+        assert_eq!(document["model_reasoning_effort"].as_str(), Some("medium"), "用户选择没有进入 config.toml");
+
+        let catalog: Value = serde_json::from_str(&codex_catalog(&provider, &settings).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "medium");
+    }
+
+    /// 旧 state.json 没有 reasoningSelections，此时全局 manual/effective 档位仍然说话。
+    #[test]
+    fn legacy_global_reasoning_level_still_works() {
+        let mut provider = provider();
+        provider.models = vec![model_with("coder", Some(effort_capability("coder", &["low", "medium", "high"])))];
+        assert!(provider.reasoning_selections.is_empty());
+
+        let settings = AppSettings {
+            manual_reasoning_level: crate::model::ReasoningLevel::High,
+            effective_reasoning_level: crate::model::ReasoningLevel::High,
+            ..AppSettings::default()
+        };
+
+        let document = DocumentMut::from_str(&merge_codex("", &provider, "secret", &settings).unwrap()).unwrap();
+        assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"), "升级后旧用户的档位失效了");
+    }
+
+    /// 预算型绑定不得被硬塞进 model_reasoning_effort。
+    #[test]
+    fn budget_binding_is_not_written_as_numeric_effort() {
+        let mut provider = provider();
+        provider.protocol = ProtocolKind::Anthropic;
+        let capability = ReasoningCapability::from_token_budget(
+            crate::reasoning_capability::ReasoningKey::new("https://api.example.com/v1", "coder"),
+            1024, 8192, false, None,
+            crate::reasoning_capability::ReasoningConfidence::Validated,
+        );
+        // 前提校验：这张能力表确实产出了 Budget 绑定，否则本测试什么都没测到。
+        assert!(capability.tiers.iter().any(|tier| matches!(tier.binding, ReasoningBinding::Budget { .. })));
+        provider.models = vec![model_with("coder", Some(capability))];
+
+        let settings = AppSettings::default();
+        let resolved = codex_reasoning(&provider, "coder", &settings);
+        assert_eq!(resolved.effort, None, "预算型绑定被写成了 effort：{:?}", resolved.effort);
+        assert!(
+            resolved.reason.contains("budget binding cannot be represented by Codex model_reasoning_effort"),
+            "缺少省略原因说明：{}", resolved.reason
+        );
+
+        let output = merge_codex("", &provider, "secret", &settings).unwrap();
+        assert!(!output.contains("8192"), "预算数字泄漏进了 Codex 配置：{output}");
+        let document = DocumentMut::from_str(&output).unwrap();
+        assert!(document.as_table().get("model_reasoning_effort").is_none());
+    }
+
+    /// 探到"不支持推理"时不写任何推理字段。
+    #[test]
+    fn unsupported_capability_omits_reasoning_field() {
+        let mut provider = provider();
+        provider.models = vec![model_with("coder", Some(ReasoningCapability::unsupported(
+            crate::reasoning_capability::ReasoningKey::new("https://api.example.com/v1", "coder"),
+            crate::reasoning_capability::ReasoningConfidence::Validated,
+        )))];
+
+        let settings = AppSettings::default();
+        let document = DocumentMut::from_str(&merge_codex("", &provider, "secret", &settings).unwrap()).unwrap();
+        assert!(document.as_table().get("model_reasoning_effort").is_none(), "不支持推理的模型仍被写入了档位");
+
+        let catalog: Value = serde_json::from_str(&codex_catalog(&provider, &settings).unwrap()).unwrap();
+        assert!(catalog["models"][0].get("default_reasoning_level").is_none());
+        assert!(catalog["models"][0].get("supported_reasoning_levels").is_none());
+    }
+
+    /// 已存的旧档位必须被删掉，不能以一个此模型并不支持的取值继续生效。
+    #[test]
+    fn stale_effort_is_removed_when_model_cannot_express_it() {
+        let mut provider = provider();
+        provider.models = vec![model_with("coder", Some(ReasoningCapability::unsupported(
+            crate::reasoning_capability::ReasoningKey::new("https://api.example.com/v1", "coder"),
+            crate::reasoning_capability::ReasoningConfidence::Validated,
+        )))];
+
+        let output = merge_codex("model_reasoning_effort = \"high\"\n", &provider, "secret", &AppSettings::default()).unwrap();
+        assert!(!output.contains("model_reasoning_effort"), "旧档位残留：{output}");
+    }
+
+    /// 档位清单完全由服务端声明的成员派生，未来新增成员自动出现。
+    #[test]
+    fn dynamic_reasoning_levels_have_no_hardcode() {
+        let mut provider = provider();
+        // ultra 不在任何内置等级表里，minimal/medium 在，xhigh 介于两者之间。
+        provider.models = vec![model_with("coder", Some(effort_capability("coder", &["minimal", "medium", "xhigh", "ultra"])))];
+
+        let catalog: Value = serde_json::from_str(&codex_catalog(&provider, &AppSettings::default()).unwrap()).unwrap();
+        let levels = catalog["models"][0]["supported_reasoning_levels"].as_array().cloned().unwrap_or_default();
+        let efforts = levels.iter().filter_map(|item| item["effort"].as_str()).collect::<Vec<_>>();
+
+        assert_eq!(efforts, vec!["minimal", "medium", "xhigh", "ultra"], "档位清单没有按服务端声明原样输出");
+        assert!(levels.iter().all(|item| item["description"].as_str().is_some_and(|text| !text.is_empty())));
     }
     #[test]
     fn codex_catalog_omits_patch_type_when_custom_probe_is_not_full() {

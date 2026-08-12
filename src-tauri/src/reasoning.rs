@@ -150,7 +150,8 @@ mod tests {
             default_model: Some(model.id.clone()), claude_model_profile: None,
             claude_extended_context: false, claude_model_mappings: ClaudeModelMappings::default(),
             codex_compatibility: CodexCompatibility::Full, codex_probe_model: None,
-            codex_probe_detail: None, models: vec![model], connection_state: "connected".into(),
+            codex_probe_detail: None, reasoning_selections: vec![],
+            models: vec![model], connection_state: "connected".into(),
             confidence: None, last_checked_at: None, applied_clients: vec![], error_summary: None,
         }
     }

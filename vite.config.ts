@@ -5,6 +5,7 @@ export default defineConfig({
   plugins: [react()],
   test: {
     exclude: ["e2e/**", "node_modules/**", "dist/**", "src-tauri/target/**"],
+    setupFiles: ["./src/test/setup.ts"],
   },
   clearScreen: false,
   server: {

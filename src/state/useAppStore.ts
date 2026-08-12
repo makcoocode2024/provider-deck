@@ -27,6 +27,7 @@ interface AppState {
   probe(draft: ProviderDraft): Promise<ProbeResult>;
   reprobeProvider(id: string): Promise<void>;
   refreshProviderModels(id: string): Promise<Provider>;
+  reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider>;
   testProvider(id: string, modelId?: string): Promise<import("../domain/types").ProviderTestReport>;
   saveProvider(draft: ProviderDraft): Promise<Provider>;
   deleteProvider(id: string): Promise<void>;
@@ -111,6 +112,24 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const refreshed = await backend.refreshProviderModels(id);
       set({ providers: get().providers.map((provider) => provider.id === refreshed.id ? refreshed : provider), operation: undefined });
+      return refreshed;
+    } catch (error) {
+      set({ operation: undefined, error: messageOf(error) });
+      throw error;
+    }
+  },
+
+  async reprobeModelReasoning(providerId, modelId) {
+    set({ operation: "正在重新探测该模型的推理能力…", error: undefined });
+    try {
+      const refreshed = await backend.reprobeModelReasoning(providerId, modelId);
+      // 探测结果同时刷新 probeResult：向导正停在"确认模型"步，能力要立刻反映到选择器上。
+      const probeResult = get().probeResult;
+      set({
+        providers: get().providers.map((provider) => provider.id === refreshed.id ? refreshed : provider),
+        probeResult: probeResult ? { ...probeResult, models: refreshed.models } : probeResult,
+        operation: undefined,
+      });
       return refreshed;
     } catch (error) {
       set({ operation: undefined, error: messageOf(error) });

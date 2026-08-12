@@ -85,23 +85,40 @@ pub async fn discover_reasoning_capability(
 ) -> DiscoveryOutcome {
     let key = ReasoningKey::new(base_url, model_id);
 
+    // 外键缓存：这条能力属于别的 (base_url, model_id)，本轮一律不复用。
+    // 记住这件事，因为上层只在 changed 为真时改写 ModelInfo.reasoning——
+    // 漏报 changed 会让属于其他端点的能力永久留在模型上。
+    let foreign_cache = cached.is_some_and(|existing| !same_key(&existing.key, &key));
+
     // 缓存短路：键一致且未过期且已有结论 → 零请求返回。
-    if let Some(existing) = cached {
-        if existing.key == key && !existing.should_rediscover() {
+    if let Some(existing) = cached.filter(|existing| same_key(&existing.key, &key)) {
+        if !existing.should_rediscover() {
+            // 写法归一化后同键但字面不同时，把键收敛到规范形式并落盘，
+            // 否则每次保存都要重新判定一次。
+            let rekeyed = existing.key != key;
+            let mut capability = existing.clone();
+            capability.key = key.clone();
             return DiscoveryOutcome {
-                capability: existing.clone(),
+                capability,
                 checked_endpoints: Vec::new(),
                 note: None,
-                changed: false,
+                changed: rekeyed,
             };
         }
     }
 
-    // 基线：键一致的旧能力才可作为基线，否则从 Unknown 起步（换 base_url 不继承）。
-    let baseline = cached
-        .filter(|existing| existing.key == key)
-        .cloned()
-        .unwrap_or_else(|| ReasoningCapability::unknown(key.clone()));
+    // 基线：只有指向同一 (base_url, model_id) 的旧能力才可作为基线，
+    // 否则从 Unknown 起步（换 base_url 不继承任何事实、证据与置信度）。
+    let baseline = match cached.filter(|existing| same_key(&existing.key, &key)) {
+        Some(existing) => {
+            let mut existing = existing.clone();
+            // merge() 用字面相等校验 key。归一化后同键但字面不同时必须先收敛，
+            // 否则本轮新证据会被 merge 拒收，Tier 阶梯白跑。
+            existing.key = key.clone();
+            existing
+        }
+        None => ReasoningCapability::unknown(key.clone()),
+    };
 
     let adapter = adapter_for(protocol);
     let mut state = DiscoveryState {
@@ -110,6 +127,7 @@ pub async fn discover_reasoning_capability(
         notes: Vec::new(),
         got_conclusion: false,
         probe_completed: false,
+        fetched: Vec::new(),
     };
 
     run_tier0(&mut state, client, adapter.as_ref(), base_url, model_id, api_key, metadata, &key).await;
@@ -134,12 +152,34 @@ pub async fn discover_reasoning_capability(
 
     // 首次发现必须落盘，哪怕结论是 Unknown——否则盘上没有记录，
     // 下次保存无缓存可短路，退避窗口形同虚设。
-    let changed = state.capability != baseline || (cached.is_none() && settled);
+    //
+    // 外键缓存同样必须落盘，且不受网络结果影响：本轮产出（哪怕是 Unknown）取代的是
+    // 一条属于其他端点的能力，这个替换本身就是变化。网络不可达不能成为隔离键的例外，
+    // 否则探测失败时旧端点的能力会继续留在模型上。
+    let changed = foreign_cache || state.capability != baseline || (cached.is_none() && settled);
     DiscoveryOutcome {
         capability: state.capability,
         checked_endpoints: state.checked_endpoints,
         note: if state.notes.is_empty() { None } else { Some(state.notes.join(" ")) },
         changed,
+    }
+}
+
+/// 两个归属键是否指向同一个 (base_url, model_id)。
+///
+/// model_id 严格逐字比较：模型标识是服务端的字面量，`gpt-x` 与 `gpt-X` 可以是两个模型。
+/// base_url 先归一化再比较，因为同一端点存在多种等价写法（末尾斜杠、大小写主机名、
+/// 省略的默认端口）。归一化只用于消除书写差异，不放宽判定：normalize 失败时退回逐字
+/// 比较，绝不因为"解析不出来"就判定为同键。
+fn same_key(left: &ReasoningKey, right: &ReasoningKey) -> bool {
+    if left.model_id != right.model_id { return false; }
+    if left.base_url == right.base_url { return true; }
+    match (
+        crate::protocol::normalize_base_url(&left.base_url),
+        crate::protocol::normalize_base_url(&right.base_url),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -166,12 +206,32 @@ struct DiscoveryState {
     /// Tier 2 是否真的拿到了服务端响应（而非网络失败）。
     /// 只有"探测确实完成"才重置 TTL 窗口，否则一次网络抖动会白白锁住 6 小时。
     probe_completed: bool,
+    /// 本轮已 GET 过的只读端点 → 响应体。
+    ///
+    /// Tier 0 的 metadata_target 与 Tier 1 的 introspection_target 可以解析到同一个 URL
+    /// （Gemini 就是如此）：两级都想读同一份模型清单。同一轮 discovery 内对同一个 URL
+    /// 发第二次 GET 拿到的必然是同一份内容，纯属浪费，所以这里缓存首次结果供后续复用。
+    ///
+    /// 只缓存 GET：Tier 2 的 validation probe 是 POST 且带副作用语义，不参与复用。
+    /// 不缓存失败（4xx/5xx/网络错误）：失败可能是瞬时的，重试的语义要保留给上层 Tier 阶梯。
+    fetched: Vec<(String, Value)>,
 }
 
 impl DiscoveryState {
     fn mark(&mut self, endpoint: &str) {
         if !self.checked_endpoints.iter().any(|item| item == endpoint) {
             self.checked_endpoints.push(endpoint.to_owned());
+        }
+    }
+
+    /// 本轮是否已成功读过这个只读端点。
+    fn cached_body(&self, endpoint: &str) -> Option<&Value> {
+        self.fetched.iter().find(|(url, _)| url == endpoint).map(|(_, body)| body)
+    }
+
+    fn remember_body(&mut self, endpoint: &str, body: &Value) {
+        if self.cached_body(endpoint).is_none() {
+            self.fetched.push((endpoint.to_owned(), body.clone()));
         }
     }
 
@@ -211,7 +271,11 @@ async fn run_tier0(
             let Some(resolved) = join_endpoint(base_url, &target.endpoint) else { return };
             state.mark(&resolved);
             match fetch_json(client.get(&resolved), target.auth, api_key).await {
-                ProbeResponse::Json { status, body } if (200..300).contains(&status) => Some(body),
+                ProbeResponse::Json { status, body } if (200..300).contains(&status) => {
+                    // 记下响应体：Tier 1 可能声明同一个 URL，让它复用而不是再发一次。
+                    state.remember_body(&resolved, &body);
+                    Some(body)
+                }
                 ProbeResponse::Json { .. } | ProbeResponse::Opaque { .. } => None,
                 ProbeResponse::Transport => {
                     state.note("模型元数据端点不可达，已保留既有推理能力结论。");
@@ -241,18 +305,26 @@ async fn run_tier1(
 ) {
     for target in adapter.introspection_targets(model_id) {
         let Some(resolved) = join_endpoint(base_url, &target.endpoint) else { continue };
-        let request = if target.method.eq_ignore_ascii_case("POST") {
-            client.post(&resolved)
-        } else {
-            client.get(&resolved)
-        };
+        let is_get = !target.method.eq_ignore_ascii_case("POST");
         state.mark(&resolved);
-        let body = match fetch_json(request, target.auth, api_key).await {
-            ProbeResponse::Json { status, body } if (200..300).contains(&status) => body,
-            ProbeResponse::Json { .. } | ProbeResponse::Opaque { .. } => continue,
-            ProbeResponse::Transport => {
-                state.note("能力查询端点不可达，已保留既有推理能力结论。");
-                continue;
+
+        // Tier 0 本轮已经读过这个 URL：直接复用响应体。
+        // 同一轮内对同一个只读端点的第二次 GET 拿到的是同一份内容，请求本身是纯浪费。
+        let body = match state.cached_body(&resolved).filter(|_| is_get).cloned() {
+            Some(body) => body,
+            None => {
+                let request = if is_get { client.get(&resolved) } else { client.post(&resolved) };
+                match fetch_json(request, target.auth, api_key).await {
+                    ProbeResponse::Json { status, body } if (200..300).contains(&status) => {
+                        if is_get { state.remember_body(&resolved, &body); }
+                        body
+                    }
+                    ProbeResponse::Json { .. } | ProbeResponse::Opaque { .. } => continue,
+                    ProbeResponse::Transport => {
+                        state.note("能力查询端点不可达，已保留既有推理能力结论。");
+                        continue;
+                    }
+                }
             }
         };
 
@@ -1017,6 +1089,186 @@ mod tests {
         let requests = recorded.lock().unwrap().clone();
         let probe = requests.iter().find(|request| request.contains(":generateContent")).expect("未发出探测");
         assert!(probe.contains("maxOutputTokens"), "Gemini 探测缺少输出上限：{probe}");
+    }
+
+    /// 键不匹配的缓存 + 网络失败：上层只在 `changed` 为真时改写 ModelInfo.reasoning，
+    /// 因此这里必须报 true，否则属于其他 base_url 的能力会一直留在模型上。
+    ///
+    /// 隔离键是"推理能力属于 (base_url, model_id)"这条约束的唯一执行点，
+    /// 网络不可达不能成为它的例外。
+    #[tokio::test]
+    async fn foreign_key_cache_is_always_reported_as_changed() {
+        let base_url = dead_base_url();
+        let foreign = supported_cache("https://other.example.com/v1", "gpt-x");
+        let outcome = discover_reasoning_capability(
+            &test_client(), ProtocolKind::Openai, &base_url, "gpt-x", "key",
+            MetadataSource::Attempted, Some(&foreign),
+        )
+        .await;
+
+        assert!(
+            outcome.changed,
+            "键不匹配的缓存未被标记为 changed，上层会继续沿用属于其他 base_url 的能力"
+        );
+    }
+
+    /// 隔离键的另一半：model_id 变了同样不能复用。
+    /// base_url 相同容易让人只盯着 URL，但一个端点下的两个模型能力可以完全不同。
+    #[tokio::test]
+    async fn foreign_model_id_cache_is_not_reused() {
+        let (base_url, _recorded) = mock_server(vec![("", 500, r#"{"error":{"message":"internal"}}"#)]);
+        // 同一个 base_url 下属于 gpt-other 的能力，绝不能落到 gpt-x 上。
+        let foreign = supported_cache(&base_url, "gpt-other");
+        let outcome = discover_reasoning_capability(
+            &test_client(), ProtocolKind::Openai, &base_url, "gpt-x", "key",
+            MetadataSource::Attempted, Some(&foreign),
+        )
+        .await;
+
+        assert!(outcome.changed, "model_id 不匹配的缓存未被标记为 changed");
+        assert_eq!(outcome.capability.key, ReasoningKey::new(&base_url, "gpt-x"));
+        assert_ne!(outcome.capability.support, ReasoningSupport::Supported, "跨 model_id 继承了结论");
+        assert!(outcome.capability.tiers.is_empty(), "跨 model_id 继承了旧档位");
+    }
+
+    /// 外键缓存不得留下任何残留：档位、证据、置信度都属于旧端点。
+    /// 只丢 capability 却保留 confidence 会让 UI 显示"已验证"的空能力。
+    #[tokio::test]
+    async fn foreign_key_cache_leaves_no_residue() {
+        let base_url = dead_base_url();
+        let mut foreign = supported_cache("https://other.example.com/v1", "gpt-x");
+        foreign.confidence = ReasoningConfidence::Validated;
+        foreign.push_evidence(ReasoningEvidence::new(
+            EvidenceSource::CapabilityValidation,
+            Some("https://other.example.com/v1/chat/completions".into()),
+            "属于其他端点的证据",
+        ));
+
+        let outcome = discover_reasoning_capability(
+            &test_client(), ProtocolKind::Openai, &base_url, "gpt-x", "key",
+            MetadataSource::Attempted, Some(&foreign),
+        )
+        .await;
+
+        assert!(outcome.changed);
+        assert!(outcome.capability.tiers.is_empty(), "保留了旧端点的档位");
+        assert!(
+            outcome.capability.confidence < ReasoningConfidence::Validated,
+            "保留了旧端点的置信度：{:?}",
+            outcome.capability.confidence
+        );
+        assert!(
+            !outcome.capability.evidence.iter().any(|item| item.detail.contains("属于其他端点的证据")),
+            "保留了旧端点的证据"
+        );
+    }
+
+    /// base_url 归一化后同键：末尾斜杠这类写法差异不该被当成换了端点。
+    /// 判成外键会白白丢掉有效能力并重发探测；这里断言零请求短路仍然成立。
+    #[tokio::test]
+    async fn normalized_base_url_still_hits_the_cache() {
+        let (base_url, recorded) = mock_server(vec![("", 500, r#"{"error":{"message":"internal"}}"#)]);
+        // 缓存写的是带末尾斜杠的等价写法，当前调用用的是规范形式。
+        let cached = supported_cache(&format!("{base_url}/"), "gpt-x");
+        let outcome = discover_reasoning_capability(
+            &test_client(), ProtocolKind::Openai, &base_url, "gpt-x", "key",
+            MetadataSource::Attempted, Some(&cached),
+        )
+        .await;
+
+        assert!(recorded.lock().unwrap().is_empty(), "归一化后同键却重新发起了探测");
+        assert_eq!(outcome.capability.support, ReasoningSupport::Supported, "归一化后同键却丢了能力");
+        assert_eq!(outcome.capability.tiers.len(), cached.tiers.len());
+        // 键收敛到规范形式需要落盘，否则每次保存都要重新判定一次。
+        assert_eq!(outcome.capability.key, ReasoningKey::new(&base_url, "gpt-x"));
+        assert!(outcome.changed, "键收敛必须落盘");
+    }
+
+    /// Gemini 的 Tier 0 metadata_target 与 Tier 1 introspection_target 解析到同一个 URL。
+    /// Tier 0 拿不到线索时 Tier 1 会原样再请求一次，属于纯浪费的重复请求。
+    /// checked_endpoints 会去重，所以这个浪费在产出里是不可见的——只能靠请求计数抓。
+    #[tokio::test]
+    async fn tiers_never_request_the_same_endpoint_twice() {
+        let (base_url, recorded) = mock_server(vec![
+            ("/v1beta/models/gemini-x", 200, r#"{"name":"models/gemini-x"}"#),
+            (":generateContent", 400, r#"{"error":{"message":"nothing useful"}}"#),
+        ]);
+        discover_reasoning_capability(
+            &test_client(), ProtocolKind::Gemini, &base_url, "models/gemini-x", "key",
+            MetadataSource::Absent, None,
+        )
+        .await;
+
+        let metadata_hits = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.contains("/v1beta/models/gemini-x") && !request.contains(":generateContent")
+            })
+            .count();
+        assert_eq!(metadata_hits, 1, "同一元数据端点被请求了 {metadata_hits} 次");
+    }
+
+    /// 去重不能改变结论：Tier 1 复用 Tier 0 的响应体后，从中得出的能力必须与
+    /// 真的再请求一次完全一致。只数请求数会让"跳过 Tier 1"这种错误修法也通过。
+    #[tokio::test]
+    async fn reused_metadata_body_still_yields_the_same_conclusion() {
+        // Tier 0 的 metadata_hints 读不出预算区间（thinkingConfig 在此响应里只有区间字段，
+        // 足以产出结论），Tier 1 复用同一份响应体应得到同样的结论。
+        let (base_url, recorded) = mock_server(vec![(
+            "/v1beta/models/gemini-x",
+            200,
+            r#"{"name":"models/gemini-x","thinkingConfig":{"thinkingBudgetMin":1024,"thinkingBudgetMax":24576}}"#,
+        )]);
+        let outcome = discover_reasoning_capability(
+            &test_client(), ProtocolKind::Gemini, &base_url, "models/gemini-x", "key",
+            MetadataSource::Absent, None,
+        )
+        .await;
+
+        let metadata_hits = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains("/v1beta/models/gemini-x") && !request.contains(":generateContent"))
+            .count();
+        assert_eq!(metadata_hits, 1, "同一元数据端点被请求了 {metadata_hits} 次");
+        assert_eq!(outcome.capability.support, ReasoningSupport::Supported);
+        assert!(
+            matches!(
+                outcome.capability.control,
+                ReasoningControl::TokenBudget { min: 1024, max: 24576, .. }
+            ),
+            "复用响应体后丢了服务端声明的预算区间：{:?}",
+            outcome.capability.control
+        );
+    }
+
+    /// 去重只作用于同一轮 discovery：两次独立调用之间不共享任何响应体。
+    /// 跨轮复用会让 TTL 过期后的重新探测读到陈旧内容。
+    #[tokio::test]
+    async fn dedupe_does_not_leak_across_discovery_rounds() {
+        let (base_url, recorded) = mock_server(vec![(
+            "/v1beta/models/gemini-x",
+            200,
+            r#"{"name":"models/gemini-x","thinkingConfig":{"thinkingBudgetMin":1024,"thinkingBudgetMax":24576}}"#,
+        )]);
+        for _ in 0..2 {
+            discover_reasoning_capability(
+                &test_client(), ProtocolKind::Gemini, &base_url, "models/gemini-x", "key",
+                MetadataSource::Absent, None,
+            )
+            .await;
+        }
+
+        let metadata_hits = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains("/v1beta/models/gemini-x") && !request.contains(":generateContent"))
+            .count();
+        assert_eq!(metadata_hits, 2, "两轮独立 discovery 应各自请求一次，实际 {metadata_hits} 次");
     }
 
     /// TTL 过期触发重新探测（对照未过期短路用例）。

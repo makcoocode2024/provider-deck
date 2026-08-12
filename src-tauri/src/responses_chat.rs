@@ -255,14 +255,10 @@ pub fn responses_to_chat(request: &Value, previous_messages: Option<&[Value]>) -
         if let Some(value) = request.get(key) { body.insert(key.into(), value.clone()); }
     }
     if let Some(effort) = request.pointer("/reasoning/effort").and_then(Value::as_str) {
-        if matches!(effort, "minimal" | "low" | "medium" | "high") {
-            body.insert("reasoning_effort".into(), Value::String(effort.into()));
-        } else if matches!(effort, "xhigh" | "max") {
-            body.insert("reasoning_effort".into(), Value::String("high".into()));
-            warnings.push(format!("Chat 后端不支持 Responses reasoning effort={effort}，已降级为 high"));
-        } else {
-            warnings.push(format!("Chat 后端不支持 Responses reasoning effort={effort}，已省略该字段"));
-        }
+        // 不再硬编码档位白名单。Chat Completions 的 reasoning_effort 是服务端定义的枚举，
+        // 新成员由服务端声明——这里的规则只有一条：reasoning.effort → reasoning_effort。
+        // 无法可靠判断"是否被 Chat 后端支持"时保留原值，宁可让后端返回 400 也不擅自降级。
+        body.insert("reasoning_effort".into(), Value::String(effort.into()));
     }
     if let Some(format) = request.pointer("/text/format") {
         let response_format = if format.get("type").and_then(Value::as_str) == Some("json_schema") {
@@ -578,13 +574,13 @@ mod tests {
     }
 
     #[test]
-    fn downgrades_extended_reasoning_effort_for_chat_backends() {
+    fn passes_reasoning_effort_to_chat_backend_without_downgrade() {
         let request = json!({
             "model": "dynamic-model", "input": "x", "reasoning": { "effort": "xhigh" }
         });
         let converted = responses_to_chat(&request, None).unwrap();
-        assert_eq!(converted.body["reasoning_effort"], "high");
-        assert!(converted.warnings.iter().any(|warning| warning.contains("xhigh")));
+        assert_eq!(converted.body["reasoning_effort"], "xhigh");
+        assert!(converted.warnings.is_empty(), "不应降级未知档位：{:?}", converted.warnings);
     }
 
     #[test]

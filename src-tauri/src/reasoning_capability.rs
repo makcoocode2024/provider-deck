@@ -681,6 +681,70 @@ mod tests {
         assert!(cap.is_stale());
     }
 
+    /// 三条 TTL 的实际时长，以及它们的相对关系：支持 > 不支持 > 未探明。
+    /// 关系反了会导致"探明的结论比未探明的更快过期"，等于白探。
+    #[test]
+    fn ttl_ladder_matches_support_state() {
+        let key = || ReasoningKey::new("https://api.example.com/v1", "model");
+        assert_eq!(TTL_SUPPORTED_SECONDS, 14 * 24 * 3600);
+        assert_eq!(TTL_UNSUPPORTED_SECONDS, 24 * 3600);
+        assert_eq!(TTL_UNKNOWN_SECONDS, 6 * 3600);
+        assert!(TTL_SUPPORTED_SECONDS > TTL_UNSUPPORTED_SECONDS);
+        assert!(TTL_UNSUPPORTED_SECONDS > TTL_UNKNOWN_SECONDS);
+
+        assert_eq!(ReasoningCapability::unknown(key()).ttl_seconds, TTL_UNKNOWN_SECONDS);
+        assert_eq!(
+            ReasoningCapability::unsupported(key(), ReasoningConfidence::Validated).ttl_seconds,
+            TTL_UNSUPPORTED_SECONDS
+        );
+        assert_eq!(
+            ReasoningCapability::from_effort_enum(key(), &["low".into()], ReasoningConfidence::Declared).ttl_seconds,
+            TTL_SUPPORTED_SECONDS
+        );
+    }
+
+    /// 未探明同样要缓存：TTL 窗口内不得再次触发发现，否则每次保存都重发探测。
+    #[test]
+    fn unknown_within_ttl_does_not_rediscover() {
+        let cap = ReasoningCapability::unknown(ReasoningKey::new("https://api.example.com/v1", "model"));
+        assert!(!cap.should_rediscover(), "刚写入的 Unknown 被判定为需要立刻重探");
+
+        let mut expired = cap.clone();
+        expired.discovered_at = (chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339();
+        assert!(expired.should_rediscover(), "超过 6 小时的 Unknown 仍未过期");
+    }
+
+    /// 置信度阶梯的序必须是 Unknown < Declared < Validated < Verified。
+    /// merge 与 absorb_validation 都靠这个 Ord 判断"新证据是否更可信"，
+    /// 顺序写错会让低置信结论顶掉高置信结论。
+    #[test]
+    fn confidence_ladder_is_ordered() {
+        use ReasoningConfidence::{Declared, Unknown, Validated, Verified};
+        assert!(Unknown < Declared);
+        assert!(Declared < Validated);
+        assert!(Validated < Verified);
+    }
+
+    /// 时间戳必须可解析回 RFC3339，否则 is_stale 会把一切判为过期。
+    #[test]
+    fn evidence_records_a_parseable_timestamp() {
+        let evidence = ReasoningEvidence::new(EvidenceSource::CapabilityValidation, None, "detail");
+        assert!(chrono::DateTime::parse_from_rfc3339(&evidence.observed_at).is_ok());
+    }
+
+    /// 旧 state.json 里的 `validation-probe` / `billed-probe` 必须仍能反序列化。
+    #[test]
+    fn legacy_evidence_source_names_still_deserialize() {
+        let legacy: EvidenceSource = serde_json::from_str("\"validation-probe\"").expect("旧证据来源无法反序列化");
+        assert_eq!(legacy, EvidenceSource::ValidationProbe);
+        assert!(serde_json::from_str::<EvidenceSource>("\"billed-probe\"").is_ok());
+        // 新名写出后必须是 kebab-case，与前端约定一致。
+        assert_eq!(
+            serde_json::to_string(&EvidenceSource::CapabilityValidation).unwrap(),
+            "\"capability-validation\""
+        );
+    }
+
     #[test]
     fn merge_keeps_higher_confidence() {
         let mut base = ReasoningCapability::unknown(ReasoningKey::new("https://api.example.com/v1", "model"));
@@ -726,6 +790,100 @@ mod tests {
         let values = vec!["low".into(), "medium".into(), "LOW".into(), "high".into()];
         let result = dedup_preserving_order(&values);
         assert_eq!(result, vec!["low", "medium", "high"]);
+    }
+
+    /// Step 4 的消费契约：前端只读 tiers，因此每个档位都必须自带 id / label /
+    /// wireSummary，且键名是 camelCase。少任何一项前端就得自己拼字符串，
+    /// 那等于把协议差异漏回前端。
+    #[test]
+    fn tiers_serialize_as_a_self_describing_camel_case_contract() {
+        let cap = ReasoningCapability::from_effort_enum(
+            ReasoningKey::new("https://api.example.com/v1", "model"),
+            &["low".into(), "medium".into(), "high".into()],
+            ReasoningConfidence::Declared,
+        );
+        let json = serde_json::to_value(&cap).expect("序列化失败");
+
+        for field in ["key", "support", "control", "tiers", "defaultTier", "confidence", "evidence", "ttlSeconds"] {
+            assert!(json.get(field).is_some(), "缺少前端需要的字段：{field}");
+        }
+        assert!(json.pointer("/key/baseUrl").is_some(), "key 未按 camelCase 序列化");
+
+        let tiers = json["tiers"].as_array().expect("tiers 不是数组");
+        assert_eq!(tiers.len(), 3);
+        for tier in tiers {
+            for field in ["tier", "id", "label", "binding", "wireSummary"] {
+                assert!(tier.get(field).is_some(), "档位缺少字段 {field}：{tier}");
+            }
+            assert!(!tier["id"].as_str().unwrap_or_default().is_empty(), "档位 id 为空");
+            assert!(!tier["label"].as_str().unwrap_or_default().is_empty(), "档位 label 为空");
+        }
+    }
+
+    /// 档位 id 是前端 select 的 value，必须唯一。
+    #[test]
+    fn tier_ids_are_unique() {
+        let cases = vec![
+            ReasoningCapability::from_effort_enum(
+                ReasoningKey::new("https://api.example.com/v1", "m"),
+                &["none".into(), "minimal".into(), "low".into(), "medium".into(), "high".into(), "max".into()],
+                ReasoningConfidence::Declared,
+            ),
+            ReasoningCapability::from_token_budget(
+                ReasoningKey::new("https://api.example.com/v1", "m"),
+                0, 32_000, true, Some(-1), ReasoningConfidence::Declared,
+            ),
+            ReasoningCapability::from_boolean_toggle(
+                ReasoningKey::new("https://api.example.com/v1", "m"), true, ReasoningConfidence::Declared,
+            ),
+        ];
+        for cap in cases {
+            let mut seen: Vec<&str> = Vec::new();
+            for option in &cap.tiers {
+                assert!(!seen.contains(&option.id.as_str()), "档位 id 重复：{}", option.id);
+                seen.push(&option.id);
+            }
+        }
+    }
+
+    /// 有档位就必须有默认档位，且默认档位一定能在 tiers 里找到。
+    /// 前端要靠它做初始选中，指向不存在的档位会变成空白下拉框。
+    #[test]
+    fn default_tier_always_resolves_to_an_existing_option() {
+        let cases = vec![
+            ReasoningCapability::from_effort_enum(
+                ReasoningKey::new("https://api.example.com/v1", "m"),
+                &["low".into(), "high".into()],
+                ReasoningConfidence::Declared,
+            ),
+            ReasoningCapability::from_token_budget(
+                ReasoningKey::new("https://api.example.com/v1", "m"),
+                1024, 32_000, false, None, ReasoningConfidence::Validated,
+            ),
+            ReasoningCapability::from_boolean_toggle(
+                ReasoningKey::new("https://api.example.com/v1", "m"), true, ReasoningConfidence::Validated,
+            ),
+        ];
+        for cap in cases {
+            let tier = cap.default_tier.expect("有档位却没有默认档位");
+            assert!(cap.tier(tier).is_some(), "默认档位 {tier:?} 不在 tiers 里");
+            assert_ne!(tier, ReasoningTier::Off, "默认档位不应是关闭");
+            assert!(cap.default_option().is_some());
+        }
+    }
+
+    /// Unsupported / Unknown 不得带任何档位：前端据此决定是否显示推理控件。
+    #[test]
+    fn conclusive_negative_states_expose_no_tiers() {
+        let key = || ReasoningKey::new("https://api.example.com/v1", "m");
+        for cap in [
+            ReasoningCapability::unknown(key()),
+            ReasoningCapability::unsupported(key(), ReasoningConfidence::Validated),
+        ] {
+            assert!(cap.tiers.is_empty(), "{:?} 状态仍带档位", cap.support);
+            assert!(cap.default_tier.is_none());
+            assert!(matches!(cap.control, ReasoningControl::None));
+        }
     }
 
     #[test]

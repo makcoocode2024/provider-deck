@@ -3,13 +3,17 @@ import { Check, ChevronLeft, Eye, EyeOff, LoaderCircle, Search, ShieldCheck, X }
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import type { ClaudeModelMappings, ClaudeModelProfile, CodexCompatibility, ModelInfo, Provider, ProviderDraft } from "../domain/types";
+import type { ClaudeModelMappings, ClaudeModelProfile, CodexCompatibility, ModelInfo, Provider, ProviderDraft, ReasoningBinding, ReasoningTier } from "../domain/types";
+import { makeBindingSelection, makeSelection, selectionFor, upsertSelection } from "../domain/reasoning";
 import { normalizeBaseUrl } from "../domain/url";
 import { backend } from "../services/backend";
 import { useAppStore } from "../state/useAppStore";
+import { ReasoningTierPicker } from "./ReasoningTierPicker";
 
 const emptyToUndefined = (value: unknown) => value === null || value === undefined || value === "" ? undefined : value;
 const optionalString = z.preprocess(emptyToUndefined, z.string().trim().optional());
+
+type ReasoningSelectionShape = NonNullable<ProviderDraft["reasoningSelections"]>[number];
 
 const schema = z.object({
   id: z.string().optional(),
@@ -31,6 +35,8 @@ const schema = z.object({
     (value) => value === null ? undefined : value,
     z.object({ sonnet: optionalString, opus: optionalString, haiku: optionalString }).optional(),
   ),
+  // 选择是后端结构的原样回传，前端不校验其内容，只保证它不被 zod 剥掉。
+  reasoningSelections: z.array(z.custom<ReasoningSelectionShape>()).optional(),
 }).superRefine((draft, context) => {
   if (!draft.id && !draft.apiKey.trim()) {
     context.addIssue({ code: "custom", path: ["apiKey"], message: "请输入 API Key" });
@@ -130,7 +136,8 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
   const [keyError, setKeyError] = useState("");
   const [formError, setFormError] = useState("");
   const [startingProbe, setStartingProbe] = useState(false);
-  const { probe, saveProvider, probeResult, operation, error, clearError } = useAppStore();
+  const [reprobingReasoning, setReprobingReasoning] = useState(false);
+  const { probe, saveProvider, reprobeModelReasoning, probeResult, operation, error, clearError } = useAppStore();
   const form = useForm<ProviderDraft>({
     defaultValues: {
       id: initial?.id,
@@ -143,6 +150,7 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
       claudeModelProfile: initial?.claudeModelProfile ?? inferClaudeProfile(initial?.defaultModel),
       claudeExtendedContext: initial?.claudeExtendedContext ?? false,
       claudeModelMappings: initial?.claudeModelMappings,
+      reasoningSelections: initial?.reasoningSelections ?? [],
     },
   });
 
@@ -166,6 +174,7 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
         claudeModelProfile: initial?.claudeModelProfile ?? inferClaudeProfile(initial?.defaultModel),
         claudeExtendedContext: initial?.claudeExtendedContext ?? false,
         claudeModelMappings: initial?.claudeModelMappings,
+        reasoningSelections: initial?.reasoningSelections ?? [],
       });
       if (initial?.id) {
         setKeyState("loading");
@@ -250,6 +259,27 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
     form.setValue("claudeModelMappings", assignClaudeMapping(form.getValues("claudeModelMappings") ?? {}, profile, modelId));
   };
 
+  // 推理能力挂在探测回来的 ModelInfo 上，选择挂在草稿上：切换默认模型时能力随之改变，
+  // 但其他模型已经做过的选择必须留着——用户在两个模型间来回比较不应该丢掉任何一次选择。
+  const activeModelId = form.watch("defaultModel") ?? detectedModels[0]?.id;
+  const activeModel = detectedModels.find((model) => model.id === activeModelId);
+  const draftSelections = form.watch("reasoningSelections") ?? [];
+  const activeSelection = selectionFor(draftSelections, activeModelId);
+  const changeReasoning = (next: { tier?: ReasoningTier; binding?: ReasoningBinding }) => {
+    if (!activeModelId) return;
+    const selection = next.binding
+      ? makeBindingSelection(activeModelId, next.binding)
+      : next.tier ? makeSelection(activeModelId, next.tier) : undefined;
+    if (!selection) return;
+    form.setValue("reasoningSelections", upsertSelection(form.getValues("reasoningSelections"), selection));
+  };
+  const reprobeReasoning = async () => {
+    if (!initial?.id || !activeModelId) return;
+    setReprobingReasoning(true);
+    try { await reprobeModelReasoning(initial.id, activeModelId); }
+    finally { setReprobingReasoning(false); }
+  };
+
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -331,6 +361,16 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
                   {detectedModels.map((model) => <option value={model.id} key={model.id}>{model.displayName}（{model.id}）</option>)}
                 </select>
               </label>}
+              {activeModelId && (
+                <ReasoningTierPicker
+                  capability={activeModel?.reasoning}
+                  selection={activeSelection}
+                  onChange={changeReasoning}
+                  onReprobe={initial?.id ? () => void reprobeReasoning() : undefined}
+                  reprobing={reprobingReasoning}
+                />
+              )}
+              {probeResult?.reasoningNote && <small className="reasoning-note">{probeResult.reasoningNote}</small>}
               {detectedProtocol === "anthropic" && (
                 <section className="claude-profile" aria-label="Claude Code 映射配置">
                   <div className="form-grid">

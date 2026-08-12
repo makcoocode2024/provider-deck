@@ -656,6 +656,7 @@ mod tests {
             protocol_hint: Some(protocol), timeout_seconds: 3, azure_api_version: None,
             default_model: Some(model.into()), claude_model_profile: None,
             claude_extended_context: false, claude_model_mappings: Default::default(),
+            reasoning_selections: Vec::new(),
         }
     }
 

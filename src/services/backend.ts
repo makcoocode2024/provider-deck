@@ -14,9 +14,75 @@ import type {
   Provider,
   ProviderDraft,
   ProviderTestReport,
+  ReasoningCapability,
 } from "../domain/types";
 import { defaultSettings } from "../domain/types";
 import { normalizeBaseUrl } from "../domain/url";
+
+/**
+ * 测试后端的推理能力样本。四种形态各一份，覆盖前端所有分支。
+ * 这些值模拟"服务端声明了什么"，故意包含 `xhigh` / `ultra` 这类不在任何内置表里的成员，
+ * 用来证明前端确实只是转发后端结论。
+ */
+const mockCapabilities = (baseUrl: string): Record<string, ReasoningCapability> => {
+  const shared = { constraints: {}, evidence: [], discoveredAt: new Date().toISOString() };
+  return {
+    effortEnum: {
+      ...shared,
+      key: { baseUrl, modelId: "test-coder" },
+      support: "supported",
+      control: { kind: "effortEnum", values: ["off", "minimal", "medium", "xhigh", "ultra"] },
+      tiers: [
+        { tier: "off", id: "off", label: "关闭", binding: { kind: "effort", value: "off" }, wireSummary: "reasoning.effort = off" },
+        { tier: "light", id: "light", label: "轻度", binding: { kind: "effort", value: "minimal" }, wireSummary: "reasoning.effort = minimal" },
+        { tier: "standard", id: "standard", label: "中度", binding: { kind: "effort", value: "medium" }, wireSummary: "reasoning.effort = medium" },
+        { tier: "deep", id: "deep", label: "高", binding: { kind: "effort", value: "xhigh" }, wireSummary: "reasoning.effort = xhigh" },
+        { tier: "max", id: "max", label: "最大", binding: { kind: "effort", value: "ultra" }, wireSummary: "reasoning.effort = ultra" },
+      ],
+      defaultTier: "standard",
+      defaultReason: "服务端声明：共发现 5 个可用推理档位，默认选用中度（reasoning.effort = medium）",
+      confidence: "declared",
+      ttlSeconds: 14 * 24 * 3600,
+    },
+    tokenBudget: {
+      ...shared,
+      key: { baseUrl, modelId: "agnes-2.0-pro" },
+      support: "supported",
+      control: { kind: "tokenBudget", min: 1024, max: 24576, offAllowed: true, dynamicSentinel: -1 },
+      tiers: [
+        { tier: "off", id: "off", label: "关闭", binding: { kind: "disabled" }, wireSummary: "不启用思考预算" },
+        { tier: "light", id: "light", label: "轻度", binding: { kind: "budget", tokens: 2048 }, wireSummary: "预算 2048 tokens" },
+        { tier: "standard", id: "standard", label: "中度（模型自行分配）", binding: { kind: "dynamicBudget", sentinel: -1 }, wireSummary: "预算 -1（自动分配）" },
+        { tier: "deep", id: "deep", label: "高", binding: { kind: "budget", tokens: 12288 }, wireSummary: "预算 12288 tokens" },
+      ],
+      defaultTier: "standard",
+      confidence: "validated",
+      ttlSeconds: 14 * 24 * 3600,
+    },
+    booleanToggle: {
+      ...shared,
+      key: { baseUrl, modelId: "agnes-2.0-flash" },
+      support: "supported",
+      control: { kind: "booleanToggle" },
+      tiers: [
+        { tier: "standard", id: "standard", label: "中度", binding: { kind: "enabled" }, wireSummary: "开启思考（未探到可调区间）" },
+      ],
+      defaultTier: "standard",
+      constraints: { cannotDisable: true, notes: ["该模型无法关闭推理。"] },
+      confidence: "declared",
+      ttlSeconds: 14 * 24 * 3600,
+    },
+    unknown: {
+      ...shared,
+      key: { baseUrl, modelId: "agnes-2.0-lite" },
+      support: "unknown",
+      control: { kind: "none" },
+      tiers: [],
+      confidence: "unknown",
+      ttlSeconds: 6 * 3600,
+    },
+  };
+};
 
 export interface AppBackend {
   listProviders(): Promise<Provider[]>;
@@ -27,6 +93,8 @@ export interface AppBackend {
   probeProvider(draft: ProviderDraft): Promise<ProbeResult>;
   reprobeProvider(id: string): Promise<Provider>;
   refreshProviderModels(id: string): Promise<Provider>;
+  /** 单模型级重新探测推理能力。绕过 TTL，只影响该模型。 */
+  reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider>;
   testProvider(providerId: string, modelId?: string): Promise<ProviderTestReport>;
   detectClients(): Promise<ClientDescriptor[]>;
   previewChanges(providerId: string, clientIds: string[]): Promise<ConfigChange[]>;
@@ -58,6 +126,7 @@ class TauriBackend implements AppBackend {
   probeProvider = (draft: ProviderDraft) => invoke<ProbeResult>("probe_provider", { draft });
   reprobeProvider = (id: string) => invoke<Provider>("reprobe_provider", { id });
   refreshProviderModels = (id: string) => invoke<Provider>("refresh_provider_models", { providerId: id });
+  reprobeModelReasoning = (providerId: string, modelId: string) => invoke<Provider>("reprobe_model_reasoning", { providerId, modelId });
   testProvider = (providerId: string, modelId?: string) => invoke<ProviderTestReport>("test_provider", { providerId, modelId });
   detectClients = () => invoke<ClientDescriptor[]>("detect_clients");
   previewChanges = (providerId: string, clientIds: string[]) =>
@@ -125,6 +194,8 @@ class BrowserBackend implements AppBackend {
       codexCompatibility: probe.codexCompatibility,
       codexProbeModel: probe.codexProbeModel,
       codexProbeDetail: probe.codexProbeDetail,
+      // 剪枝后保存：模型列表里已经消失的模型不留选择，与后端 prune_missing 行为一致。
+      reasoningSelections: (draft.reasoningSelections ?? []).filter((selection) => probe.models.some((model) => model.id === selection.modelId)),
       models: probe.models,
       connectionState: "connected",
       confidence: probe.confidence,
@@ -156,18 +227,20 @@ class BrowserBackend implements AppBackend {
     if (!apiKey) throw new Error("API Key 不能为空");
     const normalized = normalizeBaseUrl(draft.baseUrl).value;
     const protocol = draft.protocolHint && draft.protocolHint !== "custom" ? draft.protocolHint : "openai";
+    const capabilities = mockCapabilities(normalized);
     const models = protocol === "anthropic" ? [
-      { id: "agnes-2.0-flash", displayName: "Agnes 2.0 Flash", protocol, source: "server" as const, capabilities: [], contextWindow: 200_000 },
-      { id: "agnes-2.0-pro", displayName: "Agnes 2.0 Pro", protocol, source: "server" as const, capabilities: [], contextWindow: 200_000 },
-      { id: "agnes-2.0-lite", displayName: "Agnes 2.0 Lite", protocol, source: "server" as const, capabilities: [], contextWindow: 200_000 },
+      { id: "agnes-2.0-flash", displayName: "Agnes 2.0 Flash", protocol, source: "server" as const, capabilities: [], contextWindow: 200_000, reasoning: capabilities.booleanToggle },
+      { id: "agnes-2.0-pro", displayName: "Agnes 2.0 Pro", protocol, source: "server" as const, capabilities: [], contextWindow: 200_000, reasoning: capabilities.tokenBudget },
+      { id: "agnes-2.0-lite", displayName: "Agnes 2.0 Lite", protocol, source: "server" as const, capabilities: [], contextWindow: 200_000, reasoning: capabilities.unknown },
     ] : [
-      { id: "test-coder", displayName: "test-coder", protocol, source: "server" as const, capabilities: [] },
+      { id: "test-coder", displayName: "test-coder", protocol, source: "server" as const, capabilities: [], reasoning: capabilities.effortEnum },
     ];
     return {
       normalizedBaseUrl: normalized,
       protocol,
       confidence: 0.94,
       models,
+      reasoningNote: `测试后端模拟：已为 ${models.length} 个模型生成推理能力样本。`,
       codexCompatibility: protocol === "openai" ? "chat-proxy" : "not-applicable",
       codexProbeModel: protocol === "openai" ? models[0]?.id : undefined,
       codexProbeDetail: protocol === "openai" ? "测试后端模拟：Responses 不可用，Chat Completions function 工具可用。" : undefined,
@@ -190,6 +263,8 @@ class BrowserBackend implements AppBackend {
     const refreshed: Provider = {
       ...provider, baseUrl: probe.normalizedBaseUrl, protocol: probe.protocol, models: probe.models,
       codexCompatibility: probe.codexCompatibility, codexProbeModel: probe.codexProbeModel, codexProbeDetail: probe.codexProbeDetail,
+      // 选择是用户意图，跨端点保留；只剪掉已经消失的模型。
+      reasoningSelections: (provider.reasoningSelections ?? []).filter((selection) => probe.models.some((model) => model.id === selection.modelId)),
       defaultModel: provider.defaultModel && (probe.models.length === 0 || probe.models.some((model) => model.id === provider.defaultModel)) ? provider.defaultModel : probe.models[0]?.id,
       connectionState: "connected", confidence: probe.confidence, lastCheckedAt: new Date().toISOString(),
       errorSummary: undefined,
@@ -201,6 +276,24 @@ class BrowserBackend implements AppBackend {
   async refreshProviderModels(id: string): Promise<Provider> {
     const provider = await this.reprobeProvider(id);
     return provider;
+  }
+
+  async reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider> {
+    this.ensureTestMode();
+    const providers = await this.listProviders();
+    const provider = providers.find((item) => item.id === providerId);
+    if (!provider) throw new Error(`未找到服务：${providerId}`);
+    // 只重探这一个模型：其余模型的能力和全部选择原样保留。
+    const capabilities = mockCapabilities(provider.baseUrl);
+    const sample = Object.values(capabilities).find((item) => item.key.modelId === modelId) ?? capabilities.effortEnum;
+    const refreshed: Provider = {
+      ...provider,
+      models: provider.models.map((model) => model.id === modelId
+        ? { ...model, reasoning: { ...sample, key: { baseUrl: provider.baseUrl, modelId } } }
+        : model),
+    };
+    localStorage.setItem(this.providerKey, JSON.stringify(providers.map((item) => item.id === providerId ? refreshed : item)));
+    return refreshed;
   }
 
   async testProvider(providerId: string, modelId?: string): Promise<ProviderTestReport> {
