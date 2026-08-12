@@ -32,9 +32,7 @@ use local_proxy::LocalProxy;
 use storage::StateStore;
 
 fn refresh_current_reasoning(state: &mut model::PersistedState, log_action: bool) {
-    let current = state.providers.iter().find(|provider| provider.is_current).cloned()
-        .or_else(|| state.providers.first().cloned());
-    reasoning::refresh_settings(&mut state.settings, current.as_ref(), log_action);
+    reasoning::refresh_settings(&mut state.settings, log_action);
 }
 
 #[tauri::command]
@@ -515,8 +513,7 @@ fn save_settings(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, mut
     if settings.timeout_seconds < 3 || settings.timeout_seconds > 120 { return Err(AppError::InvalidInput("超时必须在 3 到 120 秒之间".into())); }
     settings.local_proxy_port = Some(proxy.port());
     let providers = store.read().providers;
-    let current = providers.iter().find(|provider| provider.is_current).or_else(|| providers.first());
-    reasoning::refresh_settings(&mut settings, current, true);
+    reasoning::refresh_settings(&mut settings, true);
     for provider in providers.iter().filter(|provider| matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy)) {
         let api_key = credentials::get(&provider.id)?;
         let token = credentials::proxy_token(&provider.id)?;

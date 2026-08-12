@@ -261,14 +261,12 @@ pub struct AppSettings {
     pub locale: String,
     #[serde(default)]
     pub local_proxy_port: Option<u16>,
-    #[serde(default)]
-    pub auto_reasoning_mode: bool,
+    /// 用户显式选择的回退档位。模型自己的推理档位不走这里，见 `ReasoningCapability`。
     #[serde(default)]
     pub manual_reasoning_level: ReasoningLevel,
+    /// 由 `manual_reasoning_level` 结算而来，供 `resolve_binding` 作 legacy fallback。
     #[serde(default)]
     pub effective_reasoning_level: ReasoningLevel,
-    #[serde(default)]
-    pub reasoning_match_message: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -281,10 +279,8 @@ impl Default for AppSettings {
             clear_clipboard_seconds: 30,
             locale: "zh-CN".into(),
             local_proxy_port: None,
-            auto_reasoning_mode: false,
             manual_reasoning_level: ReasoningLevel::High,
             effective_reasoning_level: ReasoningLevel::High,
-            reasoning_match_message: None,
         }
     }
 }
@@ -295,4 +291,34 @@ pub struct PersistedState {
     pub providers: Vec<Provider>,
     pub backups: Vec<BackupRecord>,
     pub settings: AppSettings,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 自动推荐删除后，旧 state.json 里仍留着 autoReasoningMode 和
+    /// reasoningMatchMessage。AppSettings 没有 deny_unknown_fields，这两个键必须被
+    /// 静默忽略，且用户已经调好的档位一个都不能丢——升级不许改动用户的既有选择。
+    #[test]
+    fn legacy_settings_with_removed_reasoning_fields_still_load() {
+        let legacy = r#"{
+            "timeoutSeconds": 20,
+            "proxyUrl": "",
+            "allowSelfSignedCertificates": false,
+            "generateOnly": true,
+            "clearClipboardSeconds": 30,
+            "locale": "zh-CN",
+            "autoReasoningMode": true,
+            "manualReasoningLevel": "low",
+            "effectiveReasoningLevel": "medium",
+            "reasoningMatchMessage": "云端 API，不占用本机显存，自动选用中度推理模式"
+        }"#;
+
+        let settings: AppSettings = serde_json::from_str(legacy).expect("旧 state.json 无法加载");
+
+        assert_eq!(settings.manual_reasoning_level, ReasoningLevel::Low);
+        assert_eq!(settings.effective_reasoning_level, ReasoningLevel::Medium);
+        assert_eq!(settings.timeout_seconds, 20);
+    }
 }
