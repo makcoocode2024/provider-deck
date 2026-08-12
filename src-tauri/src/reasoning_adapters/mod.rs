@@ -155,6 +155,12 @@ pub trait ReasoningAdapter: Send + Sync {
     fn observe_usage(&self, _response: &Value) -> (Option<u64>, Option<u64>) {
         (None, None)
     }
+
+    /// 检查响应是否包含推理相关字段（用于 Runtime Verification）。
+    ///
+    /// 返回 true 表示响应中包含该协议的推理产物标识（如 reasoning_tokens、thinking block、thinkingTokenCount）。
+    /// 此方法不负责修改 capability、confidence 或写入 verification 记录，仅判断响应特征。
+    fn has_reasoning_in_response(&self, response: &Value) -> bool;
 }
 
 /// 根据协议类型获取对应的 Adapter。
@@ -363,6 +369,42 @@ mod tests {
                     patch.pointer
                 );
             }
+        }
+    }
+
+    /// Tier 1 是"免费无副作用"这一层，成本闸门（enforce_output_limits）只作用于 Tier 2。
+    /// 一旦某个 Adapter 把 introspection 声明成 POST，它就能绕过闸门打到生成端点，
+    /// 且 IntrospectionTarget 结构里没有任何地方能声明输出上限。
+    #[test]
+    fn introspection_targets_stay_side_effect_free() {
+        for protocol in [
+            ProtocolKind::Openai,
+            ProtocolKind::Anthropic,
+            ProtocolKind::Gemini,
+            ProtocolKind::AzureOpenai,
+            ProtocolKind::Custom,
+        ] {
+            for target in adapter_for(protocol).introspection_targets("m") {
+                assert_eq!(
+                    target.method, "GET",
+                    "{protocol:?} 的 introspection 端点 {} 不是 GET：Tier 1 没有输出上限闸门",
+                    target.endpoint
+                );
+            }
+        }
+    }
+
+    /// Tier 2 的探测体不得声明 stream：流式响应下输出上限的实际效果依赖服务端实现，
+    /// 且响应无法用 `response.json()` 一次读完，编排层的解析会退化成 Opaque。
+    #[test]
+    fn validation_probes_never_stream() {
+        for protocol in [ProtocolKind::Openai, ProtocolKind::Anthropic, ProtocolKind::Gemini] {
+            let probe = adapter_for(protocol).validation_probe("m").expect("probe missing");
+            assert_ne!(
+                probe.body.get("stream").and_then(Value::as_bool),
+                Some(true),
+                "{protocol:?} 的探测体开启了 stream"
+            );
         }
     }
 

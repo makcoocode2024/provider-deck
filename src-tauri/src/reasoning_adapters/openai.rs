@@ -134,6 +134,23 @@ impl ReasoningAdapter for OpenAIAdapter {
         // 输入推理 token OpenAI 目前不单独计费，全部算在 prompt_tokens 里
         (None, reasoning_tokens)
     }
+
+    fn has_reasoning_in_response(&self, response: &Value) -> bool {
+        // OpenAI 推理响应标识：
+        // 1. usage.completion_tokens_details.reasoning_tokens > 0
+        let has_reasoning_tokens = response
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .map(|n| n > 0)
+            .unwrap_or(false);
+
+        // 2. choices[0].message.reasoning 存在（某些 o1 系列返回推理摘要）
+        let has_reasoning_field = response
+            .pointer("/choices/0/message/reasoning")
+            .is_some();
+
+        has_reasoning_tokens || has_reasoning_field
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +260,63 @@ mod tests {
         let pointers: Vec<&str> = probe.output_limits.iter().map(|patch| patch.pointer.as_str()).collect();
         assert!(pointers.contains(&"/max_tokens"));
         assert!(pointers.contains(&"/max_completion_tokens"));
+    }
+
+    #[test]
+    fn detects_reasoning_tokens_in_response() {
+        let adapter = OpenAIAdapter;
+        let response = json!({
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 15
+                }
+            }
+        });
+        assert!(adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn detects_reasoning_field_in_response() {
+        let adapter = OpenAIAdapter;
+        let response = json!({
+            "choices": [{"message": {"content": "OK", "reasoning": "思考过程摘要"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20
+            }
+        });
+        assert!(adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_without_reasoning() {
+        let adapter = OpenAIAdapter;
+        let response = json!({
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20
+            }
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_with_zero_reasoning_tokens() {
+        let adapter = OpenAIAdapter;
+        let response = json!({
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0
+                }
+            }
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
     }
 }

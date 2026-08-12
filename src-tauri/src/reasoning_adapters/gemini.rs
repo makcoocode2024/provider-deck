@@ -181,6 +181,15 @@ impl ReasoningAdapter for GeminiAdapter {
 
         (None, thinking)
     }
+
+    fn has_reasoning_in_response(&self, response: &Value) -> bool {
+        // Gemini 推理响应标识：usageMetadata.thinkingTokenCount > 0
+        response
+            .pointer("/usageMetadata/thinkingTokenCount")
+            .and_then(Value::as_u64)
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
 }
 
 /// 从 Gemini 错误消息中提取 thinkingBudget 范围，例如 "must be between 0 and 8192"
@@ -341,5 +350,55 @@ mod tests {
         }));
         assert_eq!(input, None);
         assert_eq!(output, Some(64));
+    }
+
+    #[test]
+    fn detects_thinking_tokens_in_response() {
+        let adapter = GeminiAdapter;
+        let response = json!({
+            "candidates": [{"content": {"parts": [{"text": "OK"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "thinkingTokenCount": 32
+            }
+        });
+        assert!(adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_without_thinking_tokens() {
+        let adapter = GeminiAdapter;
+        let response = json!({
+            "candidates": [{"content": {"parts": [{"text": "OK"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5
+            }
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_with_zero_thinking_tokens() {
+        let adapter = GeminiAdapter;
+        let response = json!({
+            "candidates": [{"content": {"parts": [{"text": "OK"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "thinkingTokenCount": 0
+            }
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_without_usage_metadata() {
+        let adapter = GeminiAdapter;
+        let response = json!({
+            "candidates": [{"content": {"parts": [{"text": "OK"}]}}]
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
     }
 }

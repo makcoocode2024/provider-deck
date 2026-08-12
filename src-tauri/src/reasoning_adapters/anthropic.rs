@@ -154,6 +154,15 @@ impl ReasoningAdapter for AnthropicAdapter {
 
         (None, thinking)
     }
+
+    fn has_reasoning_in_response(&self, response: &Value) -> bool {
+        // Anthropic 推理响应标识：content[].type == "thinking"
+        response
+            .pointer("/content")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().any(|item| item.get("type").and_then(Value::as_str) == Some("thinking")))
+            .unwrap_or(false)
+    }
 }
 
 /// 从错误消息中提取预算范围，例如 "must be between 1024 and 10000"
@@ -307,5 +316,53 @@ mod tests {
         assert_eq!(probe.endpoint, "/v1/messages");
         assert_eq!(probe.body["thinking"]["budget_tokens"], 999_999);
         assert_eq!(probe.output_limits, vec![super::super::OutputLimitPatch::at("/max_tokens")]);
+    }
+
+    #[test]
+    fn detects_thinking_block_in_response() {
+        let adapter = AnthropicAdapter;
+        let response = json!({
+            "id": "msg_123",
+            "type": "message",
+            "content": [
+                {"type": "thinking", "thinking": "推理过程"},
+                {"type": "text", "text": "OK"}
+            ]
+        });
+        assert!(adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_without_thinking_block() {
+        let adapter = AnthropicAdapter;
+        let response = json!({
+            "id": "msg_123",
+            "type": "message",
+            "content": [
+                {"type": "text", "text": "OK"}
+            ]
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_with_empty_content() {
+        let adapter = AnthropicAdapter;
+        let response = json!({
+            "id": "msg_123",
+            "type": "message",
+            "content": []
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
+    }
+
+    #[test]
+    fn rejects_response_without_content_field() {
+        let adapter = AnthropicAdapter;
+        let response = json!({
+            "id": "msg_123",
+            "type": "message"
+        });
+        assert!(!adapter.has_reasoning_in_response(&response));
     }
 }
