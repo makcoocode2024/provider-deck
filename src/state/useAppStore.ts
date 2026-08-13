@@ -9,6 +9,7 @@ import type {
   ProbeResult,
   Provider,
   ProviderDraft,
+  ModelReasoningMeta,
   ReasoningTier,
   RuntimeVerification,
 } from "../domain/types";
@@ -27,10 +28,20 @@ interface AppState {
   probeResult?: ProbeResult;
   changes: ConfigChange[];
   applyResults: ApplyResult[];
+  /**
+   * 推理档位可选面的投影缓存，key 见 {@link reasoningMetaKey}。
+   *
+   * 与 `providers` 分开存：它不是 Provider 的字段，也不该被 `listProviders()` 的
+   * 返回值覆盖或清空。存在这里纯为避免切模型来回跳时重复 invoke。
+   */
+  reasoningMeta: Record<string, ModelReasoningMeta>;
+  /** 正在探测的 key 集合。做成集合而不是单个 boolean：向导里可能同时有多个模型卡片。 */
+  detectingReasoning: Record<string, boolean>;
   hydrate(): Promise<void>;
   probe(draft: ProviderDraft): Promise<ProbeResult>;
   reprobeProvider(id: string): Promise<void>;
   refreshProviderModels(id: string): Promise<Provider>;
+  detectModelReasoning(providerId: string, modelId: string): Promise<ModelReasoningMeta | undefined>;
   reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider>;
   verifyModelReasoning(providerId: string, modelId: string, tier: ReasoningTier): Promise<RuntimeVerification>;
   testProvider(id: string, modelId?: string): Promise<import("../domain/types").ProviderTestReport>;
@@ -47,6 +58,12 @@ interface AppState {
 
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 
+/**
+ * meta 缓存的键。带长度前缀而不是挑一个"不会出现的分隔符"：provider id 是 uuid，但 modelId 可能自带冒号、斜杠、空格
+ * （`vendor:model`、`org/model`），任何单字符分隔符都能被构造出撞车的两组输入。长度前缀让键与 (providerId, modelId) 一一对应。
+ */
+export const reasoningMetaKey = (providerId: string, modelId: string) => `${providerId.length}:${providerId}:${modelId}`;
+
 export const normalizeProviderDraft = (draft: ProviderDraft): ProviderDraft => ({
   ...draft,
   protocolHint: (draft.protocolHint as string | undefined) === "" ? undefined : draft.protocolHint,
@@ -60,6 +77,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   loading: true,
   changes: [],
   applyResults: [],
+  reasoningMeta: {},
+  detectingReasoning: {},
 
   async hydrate() {
     set({ loading: true, error: undefined });
@@ -122,6 +141,34 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (error) {
       set({ operation: undefined, error: messageOf(error) });
       throw error;
+    }
+  },
+
+  /**
+   * 拉取档位可选面的投影。**不碰** `providers`：本 action 写不到 `models`，
+   * 也写不到 `reasoningVerifications`，两条既有链路的数据一个字节都不动。
+   *
+   * 失败只落 `reasoningMeta`（保持原值或缺省），**不写 `error`**：这是个后台补充查询，
+   * 弹一条全局错误会盖掉用户正在做的事，而界面在没有 meta 时本来就能正常渲染。
+   * 也因此返回 `undefined` 而不是 throw——调用方拿不到 meta 就按"没有额外信息"渲染。
+   *
+   * 不复用 `operation`：那是全局忙碌条，档位探测是局部状态，用 `detectingReasoning`。
+   */
+  async detectModelReasoning(providerId, modelId) {
+    if (!providerId || !modelId) return undefined;
+    const key = reasoningMetaKey(providerId, modelId);
+    set({ detectingReasoning: { ...get().detectingReasoning, [key]: true } });
+    try {
+      const meta = await backend.detectModelReasoning(providerId, modelId);
+      set({
+        reasoningMeta: { ...get().reasoningMeta, [key]: meta },
+        detectingReasoning: { ...get().detectingReasoning, [key]: false },
+      });
+      return meta;
+    } catch {
+      // 保留上一次的 meta：探测失败不代表用户的档位配置没了。
+      set({ detectingReasoning: { ...get().detectingReasoning, [key]: false } });
+      return undefined;
     }
   },
 

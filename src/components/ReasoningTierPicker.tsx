@@ -1,13 +1,14 @@
 import * as Switch from "@radix-ui/react-switch";
-import { AlertTriangle, Check, Gauge, Info, LoaderCircle, RefreshCw, ShieldCheck } from "lucide-react";
+import { AlertTriangle, Check, Gauge, Info, LoaderCircle, Plus, RefreshCw, ShieldCheck } from "lucide-react";
 import type {
+  ModelReasoningMeta,
   ReasoningBinding,
   ReasoningCapability,
   ReasoningSelection,
   ReasoningTier,
   RuntimeVerification,
 } from "../domain/types";
-import type { ReasoningFallbackNotice } from "../domain/reasoning";
+import type { TierPickerGroup, WriteTargetSummary } from "../domain/reasoning";
 import {
   activeTier,
   advancedOptions,
@@ -40,12 +41,24 @@ interface Props {
   onVerify?(tier: ReasoningTier): void;
   verifying?: boolean;
   /**
-   * 未探明能力时配置写出会用的兜底档位，由 {@link fallbackNotice} 算好后传入。
+   * 配置写出会用哪个档位、这个档位从哪来。由 {@link writeTargetSummary} 算好后传入。
    *
-   * 这是**用户设定**，与 `capability` 的任何字段无关，所以单独一个入参、单独的样式类，
-   * 也绝不经过 `confidenceLabel`。`undefined` 表示不该显示兜底提示。
+   * 这是**用户设定或探测结论的投影**，单独一个入参、单独的样式类，绝不经过
+   * `confidenceLabel`。`undefined` 表示不该显示写入说明（例如探测已排除写档位）。
    */
-  fallback?: ReasoningFallbackNotice;
+  writeTarget?: WriteTargetSummary;
+  /**
+   * 档位可选面。**只读投影**，由 `detect_model_reasoning` 返回，不含任何探测结论。
+   *
+   * 缺省表示还没查到额外信息，界面按只有 `capability` 时渲染——不因为缺 meta 就说"不支持"。
+   */
+  meta?: ModelReasoningMeta;
+  /** 档位分组，由 {@link tierPickerGroups} 算好后传入。缺省则不渲染分组区。 */
+  groups?: TierPickerGroup[];
+  /** 正在拉取 `meta`。期间禁用档位控件，但**不清空**已有档位与选择。 */
+  detecting?: boolean;
+  /** 打开自定义档位编辑器。`undefined` 表示当前上下文没有编辑入口。 */
+  onCreateTier?(): void;
 }
 
 /**
@@ -56,7 +69,8 @@ interface Props {
  * 所以服务端新增成员时无需改动这里。
  */
 export function ReasoningTierPicker({
-  capability, selection, onChange, onReprobe, reprobing, verifications, onVerify, verifying, fallback,
+  capability, selection, onChange, onReprobe, reprobing, verifications, onVerify, verifying,
+  writeTarget, meta, groups, detecting, onCreateTier,
 }: Props) {
   const state = reasoningUiState(capability);
   const message = stateMessage(state);
@@ -75,12 +89,22 @@ export function ReasoningTierPicker({
           {state === "unsupported" ? <Info size={18} /> : <AlertTriangle size={18} />}
           <span>{message}</span>
         </div>
-        <FallbackNotice fallback={fallback} />
+        {/* unsupported 分支照样渲染分组区：domain 已经把 matched-custom 段摘掉了，
+            剩下的内容说明"配置里会写什么"，与"这个模型支不支持推理"是两件事。 */}
+        <TierGroups
+          groups={groups}
+          state={state}
+          selection={selection}
+          detecting={detecting}
+          onCreateTier={onCreateTier}
+        />
+        <WriteTargetNote writeTarget={writeTarget} />
         {state !== "unsupported" && onReprobe && (
           <button className="button" type="button" onClick={onReprobe} disabled={reprobing}>
             {reprobing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}重新探测
           </button>
         )}
+        <ParamKindNote meta={meta} />
         <ConstraintNotes capability={capability} />
       </section>
     );
@@ -112,6 +136,7 @@ export function ReasoningTierPicker({
                 name="reasoning-tier"
                 value={option.id}
                 checked={current === option.tier}
+                disabled={Boolean(detecting)}
                 onChange={() => onChange({ tier: option.tier })}
               />
               <span><strong>{option.label}</strong><small>{option.wireSummary}</small></span>
@@ -119,6 +144,17 @@ export function ReasoningTierPicker({
           ))}
         </div>
       )}
+
+      {/* 已探明分支也展示匹配到的自定义档位：用户为这个模型建过档位，
+          就该看见它存在，否则他会以为规则没保存成功。选中项仍由上方 radio 决定。 */}
+      <TierGroups
+        groups={groups}
+        state={state}
+        selection={selection}
+        detecting={detecting}
+        onCreateTier={onCreateTier}
+      />
+      <WriteTargetNote writeTarget={writeTarget} />
 
       {budget && (
         <p className="reasoning-budget-range">
@@ -156,6 +192,7 @@ export function ReasoningTierPicker({
         verifying={verifying}
       />
 
+      <ParamKindNote meta={meta} />
       <ConstraintNotes capability={capability} />
       {capability && capability.evidence.length > 0 && (
         <details className="advanced reasoning-evidence">
@@ -307,20 +344,90 @@ function BooleanToggle({ options, current, capability, onChange }: {
 }
 
 /**
- * 兜底档位提示。
+ * 档位分组区。三段都来自 {@link tierPickerGroups}，组件不自己筛不自己排。
  *
- * 措辞刻意与 confidence 徽章不同源：这里说的是"没探到，所以按你设的值写"，
- * 而 confidence 说的是"探到的证据有多硬"。把两者写成一句话就会让用户以为
- * 自己填的档位得到了服务端确认。
+ * 「新建自定义档位」按钮的出现条件：未探明（`unknown` / `unavailable` / `empty`）
+ * 且没有任何匹配档位。`unsupported` 一律不给入口——那是已探到的结论，
+ * 建一个档位也写不出参数，给按钮等于引导用户做无效操作。
  */
-function FallbackNotice({ fallback }: { fallback?: ReasoningFallbackNotice }) {
-  if (!fallback) return null;
+function TierGroups({ groups, state, selection, detecting, onCreateTier }: {
+  groups?: TierPickerGroup[];
+  state: ReturnType<typeof reasoningUiState>;
+  selection?: ReasoningSelection;
+  detecting?: boolean;
+  onCreateTier?(): void;
+}) {
+  if (!groups || groups.length === 0) return null;
+  const matched = groups.find((group) => group.kind === "matched-custom");
+  const showCreate = Boolean(onCreateTier) && state !== "unsupported" && state !== "supported" && !matched;
+
+  // 已探明分支里，上方的 radio 列表就是内置段的可交互形态，这里再列一遍会出现
+  // 两份同名档位。过滤放在组件而不是 domain：这是"谁负责渲染"的问题，不是分段规则。
+  const visible = state === "supported" ? groups.filter((group) => group.kind !== "builtin") : groups;
+  if (visible.length === 0) return null;
+
+  return (
+    <div className="reasoning-tier-groups">
+      {showCreate && (
+        <div className="reasoning-tier-create">
+          <button className="button" type="button" onClick={onCreateTier} disabled={Boolean(detecting)}>
+            <Plus size={16} />新建自定义档位
+          </button>
+          <small>为这个模型建一个档位，只影响配置文件写出。</small>
+        </div>
+      )}
+      {visible.map((group) => (
+        <section className={`reasoning-tier-group ${group.kind}`} key={group.kind} aria-label={group.label}>
+          <h4>{group.label}</h4>
+          <ul className="plain-list">
+            {group.items.map((item) => (
+              <li key={item.id} className={selection?.tier === item.id ? "active" : undefined}>
+                <span><strong>{item.label}</strong>{item.hint && <small>{item.hint}</small>}</span>
+                {/* 不可写如实标注，不隐藏该项：隐藏会让用户以为档位没保存成功。 */}
+                {!item.writable && <em className="muted">当前端点无可写参数</em>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * 配置写入说明。
+ *
+ * 措辞刻意与 confidence 徽章不同源：这里说的是"配置里会写哪一档、这一档从哪来"，
+ * 而 confidence 说的是"探到的证据有多硬"。把两者写成一句话就会让用户以为
+ * 自己填的档位得到了服务端确认。文案整句来自 {@link writeTargetSummary}，
+ * 与 `ConfigPreview` 逐字相同——这是"两处措辞一致"唯一可验证的实现方式。
+ */
+function WriteTargetNote({ writeTarget }: { writeTarget?: WriteTargetSummary }) {
+  if (!writeTarget) return null;
   return (
     <p className="reasoning-fallback-note">
-      <span className="reasoning-badge fallback">{fallback.tier}{fallback.custom && <em> · 自定义</em>}</span>
-      <small>{fallback.message} · 仅用于写入配置文件，实时请求仍不发送推理参数。探测成功后自动改用已探明档位。</small>
+      <span className={`reasoning-badge ${writeTarget.scene === "builtin" ? "discovered" : "fallback"}`}>
+        {writeTarget.tier}{writeTarget.custom && <em> · 自定义</em>}
+      </span>
+      <small>{writeTarget.message}{writeTarget.scopeNote ? ` ${writeTarget.scopeNote}` : ""}</small>
     </p>
   );
+}
+
+/**
+ * 原生参数形态说明。只在探到形态时出现。
+ *
+ * `unknown` 不渲染任何文字：它是"探不到"，写成"不支持某种参数"就是把未探明
+ * 伪装成探测结论——那正是本次要修的病。
+ */
+function ParamKindNote({ meta }: { meta?: ModelReasoningMeta }) {
+  if (!meta || meta.nativeParamKind === "unknown") return null;
+  const labels: Record<Exclude<ModelReasoningMeta["nativeParamKind"], "unknown">, string> = {
+    "effort-enum": "该模型的推理参数是枚举档位，内置档位可直接使用。",
+    "token-budget": "该模型的推理参数是 token 预算数值，需要自定义档位填写具体数字。",
+    "boolean-toggle": "该模型的推理参数只有开关，没有强度维度。",
+  };
+  return <small className="reasoning-default-reason">{labels[meta.nativeParamKind]}</small>;
 }
 
 function ConstraintNotes({ capability }: { capability?: ReasoningCapability }) {

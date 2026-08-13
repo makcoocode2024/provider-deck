@@ -314,6 +314,143 @@ pub fn match_name_fallback<'a>(
     })
 }
 
+/// 一条命中的规则连同它引用的档位。借用而非克隆：调用方紧接着就要投影成
+/// [`crate::model::MatchedCustomTier`]，中途复制两个结构没有意义。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatchedTier<'a> {
+    pub rule: &'a crate::model::ReasoningNameRule,
+    pub tier: &'a crate::model::CustomReasoningTier,
+}
+
+/// 命中当前模型的**全部**自定义档位，按规则表顺序。
+///
+/// 与 [`match_name_fallback`] 并存而不是替换它：那个函数回答"配置写出用哪一条"，
+/// 只需要首条命中；这个函数回答"用户还能选什么"，需要全部命中。两个问题的答案
+/// 不同，合并成一个函数就得让调用方自己截取，反而更容易错。
+///
+/// 与 [`resolve_fallback_params`] 的差别同样刻意：那里会因"当前协议没参数"跳过一级，
+/// 这里不看协议。下拉列表要让用户看见档位存在但在本协议下没填参数（由
+/// `MatchedCustomTier::supported_protocols` 表达），直接隐藏会让用户以为档位没保存成功。
+///
+/// 跳过三类规则：空 pattern（会命中一切模型）、引用已删档位的规则（静默跳过，不报错，
+/// 沿用兜底结算的降级风格）、已经出现过的档位（同一档位被多条规则命中时只留首次，
+/// 否则下拉里出现两个同名项，用户无法区分）。
+pub fn matching_custom_tiers<'a>(model_id: &str, settings: &'a crate::model::AppSettings) -> Vec<MatchedTier<'a>> {
+    use crate::model::NameMatchType;
+
+    let target = model_id.trim().to_lowercase();
+    if target.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matched: Vec<MatchedTier<'a>> = Vec::new();
+    for rule in &settings.reasoning_name_rules {
+        let pattern = rule.pattern.trim().to_lowercase();
+        if pattern.is_empty() {
+            continue;
+        }
+        let hit = match rule.match_type {
+            NameMatchType::Prefix => target.starts_with(&pattern),
+            NameMatchType::Contains => target.contains(&pattern),
+        };
+        if !hit {
+            continue;
+        }
+        // 内置档位 id 也可能被规则引用，但它不在自定义档位表里——这里只列自定义档位，
+        // 内置档位由下拉的第二段单独渲染，混进来会重复。
+        let Some(tier) = settings.custom_tier(&rule.tier_id) else { continue };
+        if matched.iter().any(|item| item.tier.id == tier.id) {
+            continue;
+        }
+        matched.push(MatchedTier { rule, tier });
+    }
+    matched
+}
+
+/// 模型原生推理参数属于哪一类。**只看 [`ReasoningControl`]，不看模型名。**
+///
+/// 未探明、探到不支持、control 为 `None` 一律 `Unknown`。把这三种压成同一个取值是
+/// 有意的：界面只需要知道"拿不出具体参数类别"，而三者各自的措辞由 support 字段决定。
+pub fn native_param_kind(capability: Option<&ReasoningCapability>) -> crate::model::NativeParamKind {
+    use crate::model::NativeParamKind;
+    use crate::reasoning_capability::ReasoningControl;
+
+    let Some(capability) = capability else { return NativeParamKind::Unknown };
+    if capability.support != ReasoningSupport::Supported {
+        return NativeParamKind::Unknown;
+    }
+    match capability.control {
+        ReasoningControl::EffortEnum { .. } => NativeParamKind::EffortEnum,
+        ReasoningControl::TokenBudget { .. } => NativeParamKind::TokenBudget,
+        ReasoningControl::BooleanToggle => NativeParamKind::BooleanToggle,
+        ReasoningControl::None => NativeParamKind::Unknown,
+    }
+}
+
+/// 内置五档能否用在这个模型上。三态，`None` 表示无法确认。
+///
+/// `Some(true)` 只在探明支持、control 是 `EffortEnum`、且档位表非空时给出——内置五档
+/// 的唯一线上表达就是 OpenAI 系的 `reasoning.effort`（见 [`resolve_tier_config`]），
+/// 预算型和开关型模型上内置档位给不出参数。
+///
+/// `Some(false)` 只在探明不支持时给出。其余（未探明、control 为 `None`、档位表为空）
+/// 一律 `None`：用 `false` 表达"不知道"会把未探明伪装成不兼容，正是本次要修的病。
+pub fn builtin_tiers_compatible(capability: Option<&ReasoningCapability>) -> Option<bool> {
+    use crate::reasoning_capability::ReasoningControl;
+
+    let capability = capability?;
+    match capability.support {
+        ReasoningSupport::Unsupported => Some(false),
+        ReasoningSupport::Unknown => None,
+        ReasoningSupport::Supported => match capability.control {
+            ReasoningControl::EffortEnum { .. } if !capability.tiers.is_empty() => Some(true),
+            _ => None,
+        },
+    }
+}
+
+/// 查探测缓存。命中条件：`(归一化 base_url, model_id)` 一致且未过期。
+///
+/// base_url 传入前必须已归一化（调用方走 `crate::protocol::normalize_base_url`），
+/// 与 [`crate::reasoning_verification::RuntimeVerification::belongs_to`] 同一套规则：
+/// 换端点不复用缓存，否则会把另一个网关的结论显示成当前网关的。
+pub fn detection_cache_hit<'a>(
+    settings: &'a crate::model::AppSettings,
+    base_url: &str,
+    model_id: &str,
+) -> Option<&'a crate::model::ReasoningDetectionCacheEntry> {
+    settings
+        .reasoning_detection_cache
+        .iter()
+        .find(|entry| entry.base_url == base_url && entry.model_id == model_id && !detection_entry_expired(entry))
+}
+
+/// 缓存条目是否过期。时间戳解析不了当作过期——宁可重算，不可展示来历不明的结论。
+fn detection_entry_expired(entry: &crate::model::ReasoningDetectionCacheEntry) -> bool {
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(&entry.detected_at) else { return true };
+    let age = chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc));
+    age.num_seconds() < 0 || age.num_seconds() as u64 >= entry.ttl_seconds
+}
+
+/// 写回探测缓存：同 `(base_url, model_id)` 覆盖，否则追加。
+///
+/// 覆盖而非追加，是因为这里存的是"当前投影"而不是历史证据——与
+/// `reasoning_verifications` 的只追加语义相反，那边每条记录都是一次真实请求的凭证，
+/// 这边只是省一次遍历的中间结果。
+pub fn upsert_detection_cache(
+    settings: &mut crate::model::AppSettings,
+    incoming: crate::model::ReasoningDetectionCacheEntry,
+) {
+    match settings
+        .reasoning_detection_cache
+        .iter_mut()
+        .find(|entry| entry.base_url == incoming.base_url && entry.model_id == incoming.model_id)
+    {
+        Some(existing) => *existing = incoming,
+        None => settings.reasoning_detection_cache.push(incoming),
+    }
+}
+
 /// 配置写出时兜底档位的来源，用于预览里说清这个参数是哪一级给的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackOrigin {
@@ -599,9 +736,10 @@ mod tests {
 mod fallback_tests {
     use super::*;
     use crate::model::{
-        AppSettings, CustomReasoningTier, NameMatchType, ProtocolKind, ReasoningFallback, ReasoningNameRule,
+        AppSettings, CustomReasoningTier, NameMatchType, ProtocolKind, ReasoningDetectionCacheEntry, ReasoningFallback,
+        ReasoningNameRule,
     };
-    use crate::reasoning_capability::ReasoningKey;
+    use crate::reasoning_capability::{ReasoningConfidence, ReasoningKey};
 
     fn tier(id: &str, openai: Option<serde_json::Value>) -> CustomReasoningTier {
         CustomReasoningTier {
@@ -847,6 +985,219 @@ mod fallback_tests {
                 );
             }
         }
+    }
+
+    /// 一个模型命中多条规则时返回全部命中，且顺序与规则表一致。
+    ///
+    /// 与 `match_name_fallback` 的差别就在这里：那个函数只回答"写出用哪条"，
+    /// 下拉列表需要"还能选什么"。
+    #[test]
+    fn matching_tiers_returns_every_hit_in_table_order() {
+        let settings = AppSettings {
+            custom_reasoning_tiers: vec![
+                tier("t-broad", Some(serde_json::json!({ "reasoning": { "effort": "low" } }))),
+                tier("t-narrow", Some(serde_json::json!({ "reasoning": { "effort": "high" } }))),
+            ],
+            reasoning_name_rules: vec![
+                rule("GLM-", NameMatchType::Prefix, "t-broad"),
+                rule("THINKING", NameMatchType::Contains, "t-narrow"),
+            ],
+            ..AppSettings::default()
+        };
+
+        let matched = matching_custom_tiers("glm-4-thinking", &settings);
+        assert_eq!(
+            matched.iter().map(|item| item.tier.id.as_str()).collect::<Vec<_>>(),
+            vec!["t-broad", "t-narrow"],
+            "顺序必须跟规则表一致，程序不替用户重排"
+        );
+        // 命中说明要带上，否则用户在长规则表里找不到是哪一条生效。
+        assert_eq!(matched[0].rule.pattern, "GLM-");
+        assert_eq!(matched[1].rule.match_type, NameMatchType::Contains);
+    }
+
+    /// 引用已删档位的规则静默跳过；内置档位 id 也不混进自定义分段。
+    #[test]
+    fn rules_pointing_at_deleted_or_builtin_tiers_are_skipped() {
+        let settings = AppSettings {
+            custom_reasoning_tiers: vec![tier("t-live", Some(serde_json::json!({ "reasoning": {} })))],
+            reasoning_name_rules: vec![
+                rule("glm-", NameMatchType::Prefix, "t-deleted"),
+                // 内置档位由下拉第二段单独渲染，命中也不该出现在自定义分段里。
+                rule("glm-", NameMatchType::Prefix, "deep"),
+                rule("glm-", NameMatchType::Prefix, "t-live"),
+            ],
+            ..AppSettings::default()
+        };
+
+        let matched = matching_custom_tiers("glm-4-plus", &settings);
+        assert_eq!(matched.len(), 1, "只该留下真实存在的自定义档位");
+        assert_eq!(matched[0].tier.id, "t-live");
+    }
+
+    /// 无命中返回空表；空 pattern 不参与；同一档位被多条规则命中只留首次。
+    #[test]
+    fn matching_tiers_returns_empty_and_dedups() {
+        let settings = AppSettings {
+            custom_reasoning_tiers: vec![tier("t-x", Some(serde_json::json!({ "reasoning": {} })))],
+            reasoning_name_rules: vec![
+                rule("   ", NameMatchType::Contains, "t-x"),
+                rule("glm-", NameMatchType::Prefix, "t-x"),
+                rule("glm", NameMatchType::Contains, "t-x"),
+            ],
+            ..AppSettings::default()
+        };
+
+        // 无匹配就是空表，绝不填充内置档位充数。
+        assert!(matching_custom_tiers("gpt-4o", &settings).is_empty());
+        assert!(matching_custom_tiers("", &settings).is_empty());
+        assert!(matching_custom_tiers("   ", &settings).is_empty());
+        // 空 pattern 那条若参与匹配，上面三个断言全部失败。
+        let matched = matching_custom_tiers("glm-4-plus", &settings);
+        assert_eq!(matched.len(), 1, "同一档位被两条规则命中时下拉里不能出现两个同名项");
+        assert_eq!(matched[0].rule.pattern, "glm-", "去重应保留首次命中的那条规则");
+        // 默认设置永远不产生匹配。
+        assert!(matching_custom_tiers("glm-4-plus", &AppSettings::default()).is_empty());
+    }
+
+    /// 参数类别只由 control 推出，未探明与不支持一律 Unknown。
+    #[test]
+    fn native_param_kind_comes_only_from_control() {
+        use crate::model::NativeParamKind;
+
+        let key = || ReasoningKey::new("https://api.example.com/v1", "m");
+        let effort =
+            ReasoningCapability::from_effort_enum(key(), &["low".into(), "high".into()], ReasoningConfidence::Declared);
+        let budget = ReasoningCapability::from_token_budget(key(), 1024, 8192, true, None, ReasoningConfidence::Declared);
+        let toggle = ReasoningCapability::from_boolean_toggle(key(), true, ReasoningConfidence::Declared);
+
+        assert_eq!(native_param_kind(Some(&effort)), NativeParamKind::EffortEnum);
+        assert_eq!(native_param_kind(Some(&budget)), NativeParamKind::TokenBudget);
+        assert_eq!(native_param_kind(Some(&toggle)), NativeParamKind::BooleanToggle);
+        // 能力缺失、未探明、不支持三种都不许落到具体类别。
+        assert_eq!(native_param_kind(None), NativeParamKind::Unknown);
+        assert_eq!(native_param_kind(Some(&ReasoningCapability::unknown(key()))), NativeParamKind::Unknown);
+        assert_eq!(
+            native_param_kind(Some(&ReasoningCapability::unsupported(key(), ReasoningConfidence::Validated))),
+            NativeParamKind::Unknown
+        );
+    }
+
+    /// 内置档位兼容性是三态：不知道必须是 None，不能写成 false。
+    #[test]
+    fn builtin_compatibility_is_three_valued() {
+        let key = || ReasoningKey::new("https://api.example.com/v1", "m");
+
+        // Some(true)：探明支持 + effort 词表 + 档位非空。内置五档就是映射到 effort 的。
+        let effort =
+            ReasoningCapability::from_effort_enum(key(), &["low".into(), "high".into()], ReasoningConfidence::Declared);
+        assert_eq!(builtin_tiers_compatible(Some(&effort)), Some(true));
+
+        // Some(false)：只在探明不支持时给出。
+        let unsupported = ReasoningCapability::unsupported(key(), ReasoningConfidence::Validated);
+        assert_eq!(builtin_tiers_compatible(Some(&unsupported)), Some(false));
+
+        // None：未探明、能力缺失、以及预算型/开关型（内置档位在这些协议上给不出参数）。
+        assert_eq!(builtin_tiers_compatible(None), None);
+        assert_eq!(builtin_tiers_compatible(Some(&ReasoningCapability::unknown(key()))), None);
+        let budget = ReasoningCapability::from_token_budget(key(), 1024, 8192, true, None, ReasoningConfidence::Declared);
+        assert_eq!(builtin_tiers_compatible(Some(&budget)), None, "预算型不能报成内置档位可用");
+        let toggle = ReasoningCapability::from_boolean_toggle(key(), true, ReasoningConfidence::Declared);
+        assert_eq!(builtin_tiers_compatible(Some(&toggle)), None);
+    }
+
+    fn cache_entry(base_url: &str, model_id: &str, detected_at: String) -> ReasoningDetectionCacheEntry {
+        ReasoningDetectionCacheEntry {
+            base_url: base_url.to_owned(),
+            model_id: model_id.to_owned(),
+            detected_at,
+            ttl_seconds: crate::reasoning_capability::TTL_UNKNOWN_SECONDS,
+            native_param_kind: crate::model::NativeParamKind::EffortEnum,
+            builtin_tiers_compatible: Some(true),
+        }
+    }
+
+    /// 缓存命中、换 base_url 不复用、过期后失效。
+    #[test]
+    fn detection_cache_hits_only_on_same_key_and_within_ttl() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mut settings = AppSettings::default();
+        upsert_detection_cache(&mut settings, cache_entry("https://a.example.com/v1", "m", fresh.clone()));
+
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "m").is_some());
+        // 同一个模型 id 在另一个网关下是另一条事实，绝不复用。
+        assert!(detection_cache_hit(&settings, "https://b.example.com/v1", "m").is_none());
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "other").is_none());
+
+        // 过期条目视为未命中，由调用方按当前能力表重算。
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(crate::reasoning_capability::TTL_UNKNOWN_SECONDS as i64 + 1))
+            .to_rfc3339();
+        upsert_detection_cache(&mut settings, cache_entry("https://a.example.com/v1", "m", stale));
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "m").is_none());
+
+        // 时间戳解析不了同样按过期处理：宁可重算，不展示来历不明的结论。
+        upsert_detection_cache(&mut settings, cache_entry("https://a.example.com/v1", "m", "not-a-timestamp".into()));
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "m").is_none());
+
+        // upsert 是覆盖不是追加：这里存的是当前投影，不是历史证据。
+        assert_eq!(settings.reasoning_detection_cache.len(), 1);
+        upsert_detection_cache(&mut settings, cache_entry("https://b.example.com/v1", "m", fresh));
+        assert_eq!(settings.reasoning_detection_cache.len(), 2);
+    }
+
+    /// 缓存条目里不许出现任何密钥片段。
+    ///
+    /// 与 `verification_record_carries_no_secrets` 同形。字段是手写的，所以这条断言
+    /// 防的是将来有人为了"方便排查"往条目里塞请求头。
+    #[test]
+    fn detection_cache_carries_no_secrets() {
+        let entry = cache_entry("https://a.example.com/v1", "m", chrono::Utc::now().to_rfc3339());
+        let json = serde_json::to_string(&entry).expect("序列化失败");
+
+        for forbidden in ["apiKey", "api_key", "sk-", "Authorization", "authorization", "Bearer"] {
+            assert!(!json.contains(forbidden), "缓存条目里出现了 {forbidden}：{json}");
+        }
+        // 字段名固定且穷举：多出任何一个键都要在这里失败，这正是本断言的目的。
+        // serde_json 未开 preserve_order，键按字典序排列，所以期望值也按字典序写。
+        let value: serde_json::Value = serde_json::from_str(&json).expect("反序列化失败");
+        let keys: Vec<&str> = value.as_object().expect("应为对象").keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["baseUrl", "builtinTiersCompatible", "detectedAt", "modelId", "nativeParamKind", "ttlSeconds"]
+        );
+    }
+
+    /// 投影不改动能力结论，也不发出站请求。
+    ///
+    /// httpmock 起一个只要收到任何请求就会计数的服务，把它的地址当作端点：
+    /// 投影函数跑完后 hits 必须是 0。这条断言防的是有人日后往这条链路里加"轻量探测"。
+    #[test]
+    fn projection_never_mutates_capability_nor_sends_requests() {
+        let server = httpmock::MockServer::start();
+        let catch_all = server.mock(|when, then| {
+            when.any_request();
+            then.status(200).body("{}");
+        });
+
+        let key = ReasoningKey::new(server.base_url(), "glm-4-plus");
+        let capability =
+            ReasoningCapability::from_effort_enum(key, &["low".into(), "high".into()], ReasoningConfidence::Declared);
+        let before = capability.clone();
+        let settings = AppSettings {
+            custom_reasoning_tiers: vec![tier("t-x", Some(serde_json::json!({ "reasoning": {} })))],
+            reasoning_name_rules: vec![rule("glm-", NameMatchType::Prefix, "t-x")],
+            ..AppSettings::default()
+        };
+
+        let _ = matching_custom_tiers("glm-4-plus", &settings);
+        let _ = native_param_kind(Some(&capability));
+        let _ = builtin_tiers_compatible(Some(&capability));
+
+        catch_all.assert_hits(0);
+        // 能力表只读：support / confidence / control / tiers 一个字节都不变。
+        assert_eq!(capability, before);
+        assert_eq!(capability.confidence, ReasoningConfidence::Declared);
+        assert_eq!(capability.support, ReasoningSupport::Supported);
     }
 
     /// 兜底结算不改变实时请求：未探明能力仍然 Omitted。

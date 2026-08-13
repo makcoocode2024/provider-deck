@@ -140,7 +140,24 @@ small { color: var(--muted); }
 /* 兜底档位。配色刻意用中性灰蓝，既不是 confirmed 的绿（那读成"已确认"），
    也不是 failed 的红（它不是错误）——它只是一个尚未被证实的用户设定。 */
 .reasoning-badge.fallback { display: inline-flex; align-items: center; width: fit-content; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; color: #46545f; background: #eceff1; border: 1px dashed #b6c0c6; }
+/* 已探明档位的徽章：实线边框对应"这是事实"，与上面的虚线（用户设定）刻意区分。
+   仍不用 confirmed 的绿——那是运行时验证的颜色，两条链路不共用视觉语言。 */
+.reasoning-badge.discovered { display: inline-flex; align-items: center; width: fit-content; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; color: #37423d; background: #eef2ef; border: 1px solid #c2ccc6; }
 .reasoning-fallback-note { display: flex; align-items: baseline; gap: 8px; margin: 0; }
+
+/* 档位分组区。三段之间用分隔线而不是卡片：它们是同一份清单的三个来源，
+   做成三张卡片会让用户以为要在三处分别做选择。 */
+.reasoning-tier-groups { display: flex; flex-direction: column; gap: 10px; }
+.reasoning-tier-group { display: flex; flex-direction: column; gap: 5px; }
+.reasoning-tier-group + .reasoning-tier-group { padding-top: 9px; border-top: 1px dashed var(--border); }
+.reasoning-tier-group h4 { margin: 0; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .02em; }
+.reasoning-tier-group li { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 4px 0; }
+.reasoning-tier-group li.active { font-weight: 600; }
+.reasoning-tier-group li span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.reasoning-tier-group li small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.reasoning-tier-group li em { flex: none; color: var(--muted); font-size: 11px; font-style: normal; }
+.reasoning-tier-create { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; }
+.reasoning-tier-create small { color: var(--muted); }
 .reasoning-fallback-note small { color: var(--muted); }
 .fallback-note { color: var(--muted); }
 .fallback-editor { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }

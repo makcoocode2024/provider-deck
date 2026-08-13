@@ -412,6 +412,111 @@ bfc0c4b…e01db13 五个 commit 提供。下表是 Phase D 的前端改动，全
 
 
 
+## 10. Phase E：模型推理档位自动探测与档位联动 UI（2026-08-13）
+
+OpenSpec 变更 ID：`add-model-reasoning-detection`，规格与任务清单在
+`openspec/changes/add-model-reasoning-detection/`。本阶段分四个模块串行开发，每个模块闸门全绿后
+由用户确认再推进下一个。截至本次提交，模块 1、2、3 已完成并确认，模块 4 尚未开始。
+
+### 10.1 要解决的问题
+
+改造前的档位 UI 有四个缺口：未探测的模型只能回落到全局 high 兜底；没有把「模型名匹配规则命中了哪些
+自定义档位」呈现出来；未知模型没有就地新建自定义档位的入口；实时请求链路与配置写入链路的提示文案
+互相冲突，用户无法判断填的档位到底会不会发出去。
+
+### 10.2 新增的核心抽象
+
+| 名称 | 位置 | 职责 |
+| --- | --- | --- |
+| `detect_model_reasoning(providerId, modelId)` | `src-tauri/src/lib.rs` | 只投影本地已有事实，不发出站请求。真要重探走 `reprobe_model_reasoning` |
+| `ModelReasoningMeta` | `model.rs` / `types.ts` | 端点可写协议、原生参数形态、命中的自定义档位、内置档位兼容性 |
+| `NativeParamKind` | `model.rs` / `types.ts` | `unknown` / `effort-enum` / `token-budget` / `boolean-toggle` |
+| `matching_custom_tiers` | `reasoning_selection.rs` | 按规则表序返回命中档位，跳过空 pattern 与悬空档位引用 |
+| `tierPickerGroups` | `src/domain/reasoning.ts` | 三段固定顺序分组：匹配到的自定义档位 → 内置档位 → 全局回退档 |
+| `writeTargetSummary` | `src/domain/reasoning.ts` | 写入场景文案的唯一来源，兜底结算仍委托既有 `fallbackNotice` |
+| `tierWritableAtEndpoint` / `autoSelectableTier` | `src/domain/reasoning.ts` | 「该档位在当前端点写不写得出参数」的唯一实现，下拉徽章与自动选中共用 |
+
+`builtinTiersCompatible` 是三值的：`true` / `false` / `null`（无法确认）。用 `false` 表示未知会把
+「不知道」伪装成「不兼容」，禁止这样简化。
+
+### 10.3 三条实现偏差（与 tasks.md 原文不同，已就地注记）
+
+1. 弹窗回调定为 `onSave(tier, rule?)` 而非 `onSaved(tier)`：`CustomTierDialog` 只回传规则草稿，
+   落盘由宿主负责，弹窗保持零 store 依赖，设置页与向导共用同一个组件。
+2. 自动选中写 `reasoningFallbacks`（逐模型兜底）而不是名称规则：规则是首命中优先，排在前面的旧规则
+   会遮蔽刚建的档位；逐模型兜底是唯一能保证该模型确实用上新档位的表达。
+3. 预填规则被用户清空时不建规则：空 pattern 会命中一切模型，存下去比不存危险。
+
+### 10.4 下一轮：模块 4
+
+`openspec/changes/add-model-reasoning-detection/tasks.md` 的 4.1–4.6 原样保留，下一轮直接推进：
+让 `ConfigPreview.tsx` 复用同一个 `writeTargetSummary`（禁止自行拼接文案），补两条 vitest
+（跨组件场景/档位名一致、错误文案不含密钥片段），然后五道闸门全跑一次。
+
+模块 4 还挂着一项先前记录、由用户指定延后到此处统一修的缺陷：`reprobe_model_reasoning` 不清
+`reasoning_detection_cache`，重探后投影仍可能读到旧缓存，脏窗口最长等于 unknown 档的 TTL（6 小时）。
+
+### 10.5 文件修改记录
+
+Rust 侧改动集中在模块 1；模块 2、3 为纯前端。整阶段 17 个文件，2121 insertions / 62 deletions。
+
+| 文件 | 模块 | 改动 |
+| --- | --- | --- |
+| `src-tauri/src/model.rs` | 1 | +206：`NativeParamKind`、`MatchedCustomTier`、`ModelReasoningMeta`、`ReasoningDetectionCacheEntry` 与 `AppSettings.reasoning_detection_cache` |
+| `src-tauri/src/reasoning_selection.rs` | 1 | +355：`matching_custom_tiers`、`native_param_kind`、`builtin_tiers_compatible` 及单测 |
+| `src-tauri/src/lib.rs` | 1 | +95：`detect_model_reasoning` 命令与注册 |
+| `src/domain/types.ts` | 2 | +47：三个类型的手写镜像 |
+| `src/services/backend.ts` | 2 | +83：接口、`TauriBackend` invoke、`BrowserBackend` 派生 |
+| `src/state/useAppStore.ts` | 2 | +47：`detectModelReasoning` action、`reasoningMeta` / `detectingReasoning` |
+| `src/domain/reasoning.ts` | 2 / 3 | +217：分组、写入文案、可写性判定 |
+| `src/components/ReasoningTierPicker.tsx` | 2 | +137/-16：分组渲染、写入说明、参数形态说明；删掉旧 `FallbackNotice` |
+| `src/components/Pages.tsx` | 3 | +46：导出 `CustomTierDialog` 与 `TierRuleDraft`，加 `prefillRule` 与规则输入 |
+| `src/components/ProviderWizard.tsx` | 2 / 3 | +107：探测触发、弹窗宿主、落盘后重探与条件自动选中 |
+| `src/styles.css` | 2 / 3 | +17：分组与 `.reasoning-badge.discovered` |
+| 测试：`reasoning.test.ts` +187、`ReasoningTierPicker.test.tsx` +176、`ProviderWizard.test.tsx` +192、`backend.test.ts` +95、`useAppStore.test.ts` +94、`e2e/reasoning-verification.spec.ts` +82 | 1–3 | 见 10.6 |
+
+`AppSettings`（TypeScript 侧）刻意不镜像 `reasoningDetectionCache`：那是后端的私有缓存，前端不读不写。
+
+### 10.6 测试结果
+
+2026-08-13 于 `G:\provider deck` 实测：
+
+| 命令 | 基线 | 本阶段 | 结果 |
+| --- | --- | --- | --- |
+| `cargo test --lib --manifest-path src-tauri/Cargo.toml` | 271 | 282 | 全绿（模块 1 实测；模块 2、3 零 Rust 改动，未重跑） |
+| `node_modules/.bin/tsc --noEmit -p tsconfig.app.json` | — | — | 0 errors |
+| `npm run test`（vitest） | 99 | 149 | 全绿 / 6 files |
+| `npm run lint`（`eslint . --max-warnings 0`） | — | — | 0 warnings |
+| `npx playwright test` | 62 | 66 | 65 passed, 1 skipped |
+
+E2E 那条 skipped 是 `e2e/onboarding.spec.ts:468` 既有的 `test.skip(project !== "narrow-chromium")`，
+在 desktop project 下自跳，与本阶段无关。新增 2 个用例 × 2 project = 4，故 62 → 66。
+
+9.6 记的 tsconfig 盲区依然成立：**`e2e/**` 不被任何 tsconfig 覆盖**，改过 e2e 之后必须重跑
+`npm run lint`，它是 e2e 在 CI 里的唯一闸门。
+
+### 10.7 文案规范（新增约束，后续不得放松）
+
+设定性取值与探测结论必须在措辞上可区分：
+
+- 自定义档位、全局回退档这类**用户设定**的取值，绝不使用「支持 / 兼容 / 已确认 / 已验证 / 已探明」。
+  兜底场景说「全局回退档（未探测，可新建自定义档位适配此模型）」，命中自定义档位说
+  「命中你设定的档位（未探测）」。
+- 只有 discovery 真的探到能力时，才允许出现「已探明档位」。
+- 所有写入说明恒附一句「仅用于写入配置文件，实时请求不发送推理参数。」——
+  这对应 9.x 一直守着的边界：`resolve_binding` 实时链路的推理参数保持 Omitted。
+- 档位在当前端点写不出参数时，行内显示「当前端点无可写参数」，不隐藏该档位。隐藏会让用户以为保存失败。
+
+### 10.8 禁止的 shortcut（Phase E 追加）
+
+9.8 各条继续有效，另加四条：
+
+1. 改 `resolve_binding` 的实时请求逻辑，或让实时链路自动填推理参数。
+2. 让 `detect_model_reasoning` 发出站请求，或让它写 `ModelInfo.reasoning`、`confidence`、
+   `reasoningVerifications` 中任何一处。
+3. Anthropic / Gemini 协议在没有自定义档位时编造推理数值 —— 必须回落全局兜底。
+4. 用模型名推断能力，或为新增结构体省掉 `#[serde(default)]`（旧 `state.json` 必须无损加载）。
+
 ---
 
 ## 会话启动摘要（Session Resume Prompt）

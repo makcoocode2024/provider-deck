@@ -11,6 +11,9 @@
 
 import type {
   CustomReasoningTier,
+  MatchedCustomTier,
+  ModelReasoningMeta,
+  NameMatchType,
   ReasoningBinding,
   ReasoningCapability,
   ReasoningConfidence,
@@ -413,6 +416,220 @@ export function fallbackNotice(
     custom: resolved.custom,
     label: originLabel(origin),
     message: messages[origin],
+  };
+}
+
+// —— 档位下拉的分组与写入场景文案。
+//
+// 这一段只做**展示投影**：它回答"有哪些可选项、怎么排、写入哪一档"，
+// 不回答"当前生效档位是什么"——那仍然只由 activeTier / fallbackNotice 给出。
+// 两处各算一遍生效档位，迟早算出不同答案。
+
+/** 下拉里的一个可选项。`kind` 决定它属于哪一段，也决定要不要打「未探测」标记。 */
+export interface TierPickerItem {
+  /** 档位 id：内置档位的固定 id、自定义档位的 uuid，或全局回退档的旧枚举取值。 */
+  id: string;
+  label: string;
+  /** 命中说明，只有 matched-custom 段有：哪条规则、什么匹配方式。 */
+  hint?: string;
+  /**
+   * 该项在当前协议下能否写出参数。`false` 表示档位存在但这个协议没填参数。
+   *
+   * 不因此隐藏该项：隐藏会让用户以为档位没保存成功。如实标注让他去补参数。
+   */
+  writable: boolean;
+}
+
+export type TierPickerGroupKind = "matched-custom" | "builtin" | "global-fallback";
+
+export interface TierPickerGroup {
+  kind: TierPickerGroupKind;
+  label: string;
+  items: TierPickerItem[];
+}
+
+const groupLabels: Record<TierPickerGroupKind, string> = {
+  "matched-custom": "匹配到的自定义档位",
+  builtin: "内置档位",
+  "global-fallback": "全局回退档",
+};
+
+/** 匹配方式的中文说明，与后端 `NameMatchType::label()` 同源同义。 */
+const matchTypeLabels: Record<NameMatchType, string> = {
+  prefix: "前缀匹配",
+  contains: "包含匹配",
+};
+
+/**
+ * 这个档位在当前端点写得出参数吗。
+ *
+ * 端点协议清单为空时（能力未探明）无从判断交集，退回"该档位至少填了一个协议"：
+ * 未探明就断言"这个档位在此端点写不出参数"是在替探测下结论。
+ *
+ * 单独一个函数是因为两处要用同一条判据——下拉里的可写标注，和新建档位后
+ * 该不该自动选中它。两处各写一遍迟早给出互相矛盾的答案。
+ */
+export function tierWritableAtEndpoint(
+  meta: ModelReasoningMeta | null | undefined,
+  tier: Pick<MatchedCustomTier, "supportedProtocols">,
+): boolean {
+  const endpointProtocols = meta?.supportedProtocols ?? [];
+  return endpointProtocols.length > 0
+    ? tier.supportedProtocols.some((item) => endpointProtocols.includes(item))
+    : tier.supportedProtocols.length > 0;
+}
+
+/**
+ * 新建档位后该不该把它设为当前模型的写入档位。
+ *
+ * 两个条件同时成立才算"适配这个模型"：
+ * 1. 它出现在后端返回的 `matchedCustomTiers` 里 —— 也就是规则真的命中了这个模型名。
+ *    命不中就自动选上，等于替用户把一条不生效的规则说成生效。
+ * 2. 它在当前端点写得出参数 —— 见 {@link tierWritableAtEndpoint}。
+ *
+ * 返回命中的那一项而不是 boolean：调用方要用它的 `tierId` 写兜底表。
+ */
+export function autoSelectableTier(
+  meta: ModelReasoningMeta | null | undefined,
+  tierId: string,
+): MatchedCustomTier | undefined {
+  const hit = meta?.matchedCustomTiers.find((tier) => tier.tierId === tierId);
+  if (!hit) return undefined;
+  return tierWritableAtEndpoint(meta, hit) ? hit : undefined;
+}
+
+/**
+ * 档位下拉的三段式分组：匹配到的自定义档位 → 内置档位 → 全局回退档。
+ *
+ * 三段顺序固定，且空分组不产出——出现一个空的「匹配到的自定义档位」标题，
+ * 用户会以为自己的规则命中了却没显示。
+ *
+ * 分段依据：
+ * - matched-custom 只来自后端返回的 `meta.matchedCustomTiers`，顺序原样保留（那是
+ *   用户规则表的顺序，程序不替他重排）。`unsupported` 态不产出这一段——用户设定
+ *   推翻不了探测到的事实。
+ * - builtin 在探明支持时来自 `capability.tiers`（服务端声明的那几档），否则来自
+ *   内置五档常量。后者的 `writable` 由 `meta.builtinTiersCompatible` 决定，
+ *   三态里只有 `true` 才算可写：`null` 是"无法确认"，标成可写就是在替探测下结论。
+ * - global-fallback 展示旧枚举原始取值（low/medium/high），与设置页下拉一致。
+ *   后端没有为这个旧枚举提供展示 label，前端就不发明一个。
+ *
+ * 所有 label 都来自后端返回值或用户自己填的名字，本函数不自造任何档位名。
+ */
+export function tierPickerGroups(
+  capability: ReasoningCapability | null | undefined,
+  meta: ModelReasoningMeta | null | undefined,
+  settings: FallbackSettings | undefined,
+): TierPickerGroup[] {
+  const state = reasoningUiState(capability);
+  const groups: TierPickerGroup[] = [];
+
+  if (state !== "unsupported") {
+    const items: TierPickerItem[] = (meta?.matchedCustomTiers ?? []).map((tier) => ({
+      id: tier.tierId,
+      label: tier.label.trim() || tier.tierId,
+      hint: `${tier.rulePattern} · ${matchTypeLabels[tier.ruleMatchType]}`,
+      writable: tierWritableAtEndpoint(meta, tier),
+    }));
+    if (items.length > 0) groups.push({ kind: "matched-custom", label: groupLabels["matched-custom"], items });
+  }
+
+  const discovered = tierOptions(capability);
+  const builtinItems: TierPickerItem[] = discovered.length > 0
+    ? discovered.map((option) => ({ id: option.id, label: option.label, hint: option.wireSummary, writable: true }))
+    : builtinReasoningTiers.map((tier) => ({
+        id: tier.id,
+        label: tier.label,
+        writable: meta?.builtinTiersCompatible === true,
+      }));
+  if (builtinItems.length > 0) groups.push({ kind: "builtin", label: groupLabels.builtin, items: builtinItems });
+
+  if (settings) {
+    groups.push({
+      kind: "global-fallback",
+      label: groupLabels["global-fallback"],
+      items: [{ id: settings.effectiveReasoningLevel, label: settings.effectiveReasoningLevel, writable: true }],
+    });
+  }
+
+  return groups;
+}
+
+/** 配置写入的三种场景。由既有 {@link ReasoningOrigin} 映射而来，不新增一套判定。 */
+export type WriteTargetScene = "matched-custom" | "builtin" | "global-fallback";
+
+/**
+ * 「配置里会写入哪个档位、这个档位从哪来」的唯一文案来源。
+ *
+ * `ReasoningTierPicker` 与 `ConfigPreview` 都调它，两处不各自拼字符串——这是
+ * "两处措辞必须一致"唯一可验证的实现方式。
+ *
+ * `undefined` 表示不该展示任何"配置写入 X"：`omitted` 场景下探测结论已经排除写档位，
+ * 此时展示一个档位名就是错的。
+ *
+ * 措辞规则：设定性取值（自定义档位、全局回退档）绝不出现"支持""兼容""已确认"
+ * "已验证"，只有 `builtin` 场景才允许说"已探明"。
+ */
+export interface WriteTargetSummary {
+  scene: WriteTargetScene;
+  /** 档位展示名。 */
+  tier: string;
+  /** 该档位是否用户自建，UI 用它决定要不要打「自定义」标记。 */
+  custom: boolean;
+  /** 一句话结论，两处界面逐字相同。 */
+  message: string;
+  /** 作用范围说明。兜底场景必须写明只影响配置写出。 */
+  scopeNote?: string;
+}
+
+export function writeTargetSummary(
+  capability: ReasoningCapability | null | undefined,
+  meta: ModelReasoningMeta | null | undefined,
+  settings: FallbackSettings | undefined,
+  modelId: string | undefined,
+  selection?: ReasoningSelection,
+): WriteTargetSummary | undefined {
+  void meta;
+  if (!settings) return undefined;
+  const scopeNote = "仅用于写入配置文件，实时请求不发送推理参数。";
+
+  if (reasoningOrigin(capability, settings, modelId) === "discovered") {
+    const option = activeOption(capability, selection);
+    // 已探明但此刻没有生效档位（用户钉死了显式 binding）时不产出场景文案：
+    // 那种情况由「高级」区自己说明，这里再说一句会出现两句解释同一件事。
+    if (!option) return undefined;
+    return {
+      scene: "builtin",
+      tier: option.label,
+      custom: false,
+      message: `配置写入：${option.label} · 已探明档位`,
+      scopeNote,
+    };
+  }
+
+  // 兜底结算复用 {@link fallbackNotice}：三级降级只有一处实现，这里只换措辞。
+  // `undefined` 即"探测结论已排除写档位"（unsupported / empty），不该展示任何档位名。
+  const notice = fallbackNotice(capability, settings, modelId);
+  if (!notice) return undefined;
+
+  if (notice.origin === "global-fallback") {
+    return {
+      scene: "global-fallback",
+      tier: notice.tier,
+      custom: notice.custom,
+      message: `配置写入：${notice.tier} · 全局回退档（未探测，可新建自定义档位适配此模型）`,
+      scopeNote,
+    };
+  }
+
+  // model-fallback 与 name-rule 在界面上是同一件事："命中了你自己设的档位"。
+  // 两者的优先级差别只影响后端选哪一条，用户看到的结论一样。
+  return {
+    scene: "matched-custom",
+    tier: notice.tier,
+    custom: notice.custom,
+    message: `配置写入：${notice.tier} · 命中你设定的档位（未探测）`,
+    scopeNote,
   };
 }
 

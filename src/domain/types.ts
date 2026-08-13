@@ -409,6 +409,53 @@ export interface CustomReasoningTier {
 export type NameMatchType = "prefix" | "contains";
 
 /**
+ * 模型原生推理参数的**类别**。后端 `model::NativeParamKind` 的镜像，serde 为 kebab-case。
+ *
+ * 存类别而不存字段名（`thinkingBudget` / `budget_tokens` / `reasoning.effort`）：
+ * 字段名是协议知识，由后端 `reasoning_adapters` 各自持有。前端再存一份等于把适配器
+ * 知识复制过来，将来新增协议要改两处。
+ *
+ * `unknown` 是"探不到"，不是某种具体形态。任何界面文案都不许把它说成"不支持"。
+ */
+export type NativeParamKind = "unknown" | "effort-enum" | "token-budget" | "boolean-toggle";
+
+/**
+ * 一条命中当前模型的自定义档位。后端 `model::MatchedCustomTier` 的镜像。
+ *
+ * 命中说明（`rulePattern` / `ruleMatchType`）必须一起展示：用户的规则表可能很长，
+ * 只告诉他"这个档位适配"，他无法在表里找出是哪一条生效，也就无从修改。
+ *
+ * `supportedProtocols` 是该档位**实际填了参数**的协议清单。空数组表示这个档位在任何
+ * 协议下都写不出参数——档位存在但不生效，界面要如实说明而不是隐藏它。
+ */
+export interface MatchedCustomTier {
+  tierId: string;
+  label: string;
+  rulePattern: string;
+  ruleMatchType: NameMatchType;
+  supportedProtocols: ProtocolKind[];
+}
+
+/**
+ * 某个模型在某个端点下的推理档位可选面。后端 `model::ModelReasoningMeta` 的镜像。
+ *
+ * **这是只读投影，不是新的一级事实。** 产生它的 `detect_model_reasoning` 不发出站请求、
+ * 不写 `ModelInfo.reasoning`、不动 confidence。要真的重新探测走 `reprobeModelReasoning`。
+ *
+ * `builtinTiersCompatible` 是三态：`true` 内置五档可用、`false` 探到不支持、
+ * `null`/`undefined` 无法确认。三态而非 boolean，因为 `false` 会把"不知道"
+ * 伪装成"不兼容"——那正是本次要修的病。
+ */
+export interface ModelReasoningMeta {
+  /** 该模型在当前端点上能用推理的协议。能力未探明或探到不支持时为空数组。 */
+  supportedProtocols: ProtocolKind[];
+  nativeParamKind: NativeParamKind;
+  /** 按用户规则表顺序排列的全部适配自定义档位。无匹配是空数组，前端不填充任何默认档。 */
+  matchedCustomTiers: MatchedCustomTier[];
+  builtinTiersCompatible?: boolean | null;
+}
+
+/**
  * 模型名匹配兜底规则。后端 `model::ReasoningNameRule` 的镜像。
  *
  * **这不是"根据模型名推断能力"。** 差别在证据来源：程序不预置任何规则，初始为空表，

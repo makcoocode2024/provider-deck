@@ -3,11 +3,13 @@ import { Check, ChevronLeft, Eye, EyeOff, LoaderCircle, Search, ShieldCheck, X }
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
-import type { ClaudeModelMappings, ClaudeModelProfile, CodexCompatibility, ModelInfo, Provider, ProviderDraft, ReasoningBinding, ReasoningTier } from "../domain/types";
-import { fallbackNotice, makeBindingSelection, makeSelection, selectionFor, upsertSelection } from "../domain/reasoning";
+import type { AppSettings, ClaudeModelMappings, ClaudeModelProfile, CodexCompatibility, CustomReasoningTier, ModelInfo, Provider, ProviderDraft, ReasoningBinding, ReasoningTier } from "../domain/types";
+import { autoSelectableTier, makeBindingSelection, makeSelection, selectionFor, tierPickerGroups, upsertFallback, upsertSelection, writeTargetSummary } from "../domain/reasoning";
 import { normalizeBaseUrl } from "../domain/url";
 import { backend } from "../services/backend";
-import { useAppStore } from "../state/useAppStore";
+import { reasoningMetaKey, useAppStore } from "../state/useAppStore";
+import type { TierRuleDraft } from "./Pages";
+import { CustomTierDialog } from "./Pages";
 import { ReasoningTierPicker } from "./ReasoningTierPicker";
 
 const emptyToUndefined = (value: unknown) => value === null || value === undefined || value === "" ? undefined : value;
@@ -138,7 +140,14 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
   const [startingProbe, setStartingProbe] = useState(false);
   const [reprobingReasoning, setReprobingReasoning] = useState(false);
   const [verifyingReasoning, setVerifyingReasoning] = useState(false);
-  const { probe, saveProvider, reprobeModelReasoning, verifyModelReasoning, probeResult, operation, error, clearError, settings } = useAppStore();
+  const [creatingTier, setCreatingTier] = useState<CustomReasoningTier | null>(null);
+  const [tierError, setTierError] = useState("");
+  const {
+    probe, saveProvider, reprobeModelReasoning, verifyModelReasoning, detectModelReasoning,
+    updateSettings, probeResult, operation, error, clearError, settings,
+  } = useAppStore();
+  const reasoningMeta = useAppStore((state) => state.reasoningMeta);
+  const detectingReasoning = useAppStore((state) => state.detectingReasoning);
   // 验证历史取自 store 里已保存的 provider，而不是 initial：验证会往 store 追加记录，
   // 读 initial 就看不到刚刚那一条。capability 仍走 probeResult，两条数据流各自的源不变。
   const savedProvider = useAppStore((state) => state.providers.find((item) => item.id === initial?.id));
@@ -283,6 +292,77 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
     try { await reprobeModelReasoning(initial.id, activeModelId); }
     finally { setReprobingReasoning(false); }
   };
+  // 档位可选面：进到"确认模型"步、且这个 provider 已入库时拉一次。
+  //
+  // 只在 `initial?.id` 存在时发：后端按 provider id 查 StateStore，新建流程还没有记录，
+  // 发过去只会拿到 ProviderNotFound。此时界面按只有 capability 渲染，功能不缺。
+  //
+  // 依赖里带 activeModelId：换默认模型要重新投影（匹配到的档位随模型名变）。
+  const metaKey = initial?.id && activeModelId ? reasoningMetaKey(initial.id, activeModelId) : undefined;
+  useEffect(() => {
+    if (step !== "models" || !initial?.id || !activeModelId) return;
+    void detectModelReasoning(initial.id, activeModelId);
+  }, [step, initial?.id, activeModelId, detectModelReasoning]);
+  const activeMeta = metaKey ? reasoningMeta[metaKey] : undefined;
+  const detectingMeta = metaKey ? Boolean(detectingReasoning[metaKey]) : false;
+
+  /**
+   * 从模型卡片新建自定义档位。
+   *
+   * 规则预填当前模型名的**全名 + 前缀匹配**：这不是按名字推断能力（那是红线），
+   * 只是把用户眼前的那个模型名填进输入框，他可以改宽、改窄，或者清空。
+   */
+  const openTierDialog = () => {
+    setTierError("");
+    setCreatingTier({
+      id: `tier-${Date.now()}`,
+      label: "",
+      description: "",
+      openaiParams: undefined,
+      anthropicParams: undefined,
+      geminiParams: undefined,
+    });
+  };
+
+  /**
+   * 保存新档位 → 落盘 settings → 重探投影 → 适配当前模型时选中它。
+   *
+   * 「选中」写的是 `reasoningFallbacks`（逐模型兜底），不是名称规则：规则表按顺序取首个
+   * 命中，前面若已有别的规则命中同一个模型，新建的这条就不会生效；而逐模型兜底压过规则，
+   * 是唯一能确保"用户刚建的档位真的用在这个模型上"的表达。
+   *
+   * 只对 `activeModelId` 一个模型写这一条，其他模型的既有选择一个字节都不动。
+   */
+  const saveTier = async (tier: CustomReasoningTier, rule?: TierRuleDraft) => {
+    if (!activeModelId) return;
+    setTierError("");
+    const nextSettings: AppSettings = {
+      ...settings,
+      customReasoningTiers: [...settings.customReasoningTiers.filter((item) => item.id !== tier.id), tier],
+      reasoningNameRules: rule
+        ? [...settings.reasoningNameRules, { id: `rule-${Date.now()}`, pattern: rule.pattern, matchType: rule.matchType, tierId: tier.id }]
+        : settings.reasoningNameRules,
+      reasoningFallbacks: settings.reasoningFallbacks,
+    };
+    try {
+      await updateSettings(nextSettings);
+    } catch (saveError) {
+      // 落盘失败就停在弹窗里：此时既没有新档位也没有新规则，自动选中无从谈起。
+      setTierError(`档位未能保存：${saveError instanceof Error ? saveError.message : String(saveError)}`);
+      return;
+    }
+    setCreatingTier(null);
+    if (!initial?.id) return;
+    const meta = await detectModelReasoning(initial.id, activeModelId);
+    // 规则没命中这个模型，或者档位在当前协议没参数 —— 都保持原选择。
+    // 自动选上一个不生效的档位，等于把"没生效"显示成"已生效"。
+    if (!autoSelectableTier(meta, tier.id)) return;
+    await updateSettings({
+      ...nextSettings,
+      reasoningFallbacks: upsertFallback(nextSettings.reasoningFallbacks, { modelId: activeModelId, tierId: tier.id }),
+    });
+  };
+
   // 验证需要一个已入库的 provider：后端 command 按 id 查 StateStore 并读取凭据，
   // 新建流程还没有 id，所以那时不传 onVerify，整个验证区不渲染。
   const verifyReasoning = async (tier: ReasoningTier) => {
@@ -384,9 +464,14 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
                   verifications={savedProvider?.reasoningVerifications}
                   onVerify={initial?.id ? (tier) => void verifyReasoning(tier) : undefined}
                   verifying={verifyingReasoning}
-                  fallback={fallbackNotice(activeModel?.reasoning, settings, activeModelId)}
+                  meta={activeMeta}
+                  detecting={detectingMeta}
+                  groups={tierPickerGroups(activeModel?.reasoning, activeMeta, settings)}
+                  writeTarget={writeTargetSummary(activeModel?.reasoning, activeMeta, settings, activeModelId, activeSelection)}
+                  onCreateTier={openTierDialog}
                 />
               )}
+              {tierError && <p className="inline-error" role="alert">{tierError}</p>}
               {probeResult?.reasoningNote && <small className="reasoning-note">{probeResult.reasoningNote}</small>}
               {detectedProtocol === "anthropic" && (
                 <section className="claude-profile" aria-label="Claude Code 映射配置">
@@ -428,6 +513,18 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
           )}
         </Dialog.Content>
       </Dialog.Portal>
+      {/* 档位弹窗挂在向导的 Dialog.Root 内、Content 外：它自带 Portal，渲染到 body，
+          不会被向导的滚动容器裁掉；放在 Root 内是为了让 Esc 只关掉最上层那一个。
+          复用设置页的同一个 CustomTierDialog —— 两个入口两套弹窗，校验规则迟早分叉。 */}
+      {creatingTier && (
+        <CustomTierDialog
+          tier={creatingTier}
+          existing={settings.customReasoningTiers}
+          prefillRule={activeModelId ? { pattern: activeModelId, matchType: "prefix" } : undefined}
+          onCancel={() => { setCreatingTier(null); setTierError(""); }}
+          onSave={(tier, rule) => void saveTier(tier, rule)}
+        />
+      )}
     </Dialog.Root>
   );
 }

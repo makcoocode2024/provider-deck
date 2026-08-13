@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ModelInfo, Provider, ReasoningCapability, RuntimeVerification } from "../domain/types";
+import type { ModelInfo, ModelReasoningMeta, Provider, ReasoningCapability, RuntimeVerification } from "../domain/types";
 import { defaultSettings } from "../domain/types";
 import { backend } from "./backend";
 
@@ -221,6 +221,99 @@ describe("TauriBackend.verifyModelReasoning 的 invoke 契约", () => {
     expect(payload).not.toHaveProperty("provider_id");
     expect(payload).not.toHaveProperty("model_id");
     expect(verification).toEqual(returned);
+  });
+});
+
+describe("TauriBackend.detectModelReasoning 的 invoke 契约", () => {
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    mocks.invoke.mockReset();
+    vi.resetModules();
+  });
+
+  it("按 camelCase 传 providerId / modelId，command 名为 detect_model_reasoning", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const returned: ModelReasoningMeta = {
+      supportedProtocols: ["openai"],
+      nativeParamKind: "effort-enum",
+      matchedCustomTiers: [],
+      builtinTiersCompatible: true,
+    };
+    mocks.invoke.mockResolvedValue(returned);
+
+    vi.resetModules();
+    const { backend: tauriBackend } = await import("./backend");
+    const meta = await tauriBackend.detectModelReasoning("p1", "test-coder");
+
+    expect(mocks.invoke).toHaveBeenCalledWith("detect_model_reasoning", {
+      providerId: "p1",
+      modelId: "test-coder",
+    });
+    // snake_case 会让 Tauri 报参数缺失，这里正面钉住不许出现。
+    const [, payload] = mocks.invoke.mock.calls[0] as [string, Record<string, unknown>];
+    expect(Object.keys(payload)).toEqual(["providerId", "modelId"]);
+    expect(payload).not.toHaveProperty("provider_id");
+    expect(payload).not.toHaveProperty("model_id");
+    expect(meta).toEqual(returned);
+  });
+});
+
+describe("BrowserBackend.detectModelReasoning", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("匹配段来自名称规则，且按规则表顺序去重", async () => {
+    const { backend: browserBackend } = await import("./backend");
+    const provider = seedProvider();
+    await browserBackend.saveSettings({
+      ...await browserBackend.getSettings(),
+      customReasoningTiers: [
+        { id: "tier-x", label: "超深", openaiParams: { reasoning: { effort: "xhigh" } } },
+        { id: "tier-y", label: "极限", anthropicParams: { thinking: { budget_tokens: 4096 } } },
+      ],
+      reasoningNameRules: [
+        { id: "r1", pattern: "test-", matchType: "prefix", tierId: "tier-x" },
+        { id: "r2", pattern: "coder", matchType: "contains", tierId: "tier-y" },
+        // 同一档位命中两次只出现一次：下拉里出现两个同名项是 bug，不是信息。
+        { id: "r3", pattern: "test", matchType: "contains", tierId: "tier-x" },
+        // 指向已删除的档位：整条跳过，不产出空项。
+        { id: "r4", pattern: "test", matchType: "contains", tierId: "gone" },
+      ],
+    });
+
+    const meta = await browserBackend.detectModelReasoning(provider.id, "test-coder");
+    expect(meta.matchedCustomTiers.map((tier) => tier.tierId)).toEqual(["tier-x", "tier-y"]);
+    expect(meta.matchedCustomTiers[0]).toMatchObject({ label: "超深", rulePattern: "test-", ruleMatchType: "prefix" });
+    // OpenAI 系三个协议共用一份参数，一并列出——只报 openai 会让 Azure 端点上的用户误判。
+    expect(meta.matchedCustomTiers[0].supportedProtocols).toEqual(["openai", "azure-openai", "custom"]);
+    expect(meta.matchedCustomTiers[1].supportedProtocols).toEqual(["anthropic"]);
+  });
+
+  it("已探明 effortEnum：形态与内置档位可用性都如实投影", async () => {
+    const { backend: browserBackend } = await import("./backend");
+    const provider = seedProvider();
+    const meta = await browserBackend.detectModelReasoning(provider.id, "test-coder");
+    expect(meta.nativeParamKind).toBe("effort-enum");
+    expect(meta.builtinTiersCompatible).toBe(true);
+    expect(meta.supportedProtocols).toEqual(["openai"]);
+  });
+
+  it("模型未探测时形态为 unknown，且不断言内置档位可用", async () => {
+    const { backend: browserBackend } = await import("./backend");
+    const provider = seedProvider({ models: [{ ...model, reasoning: undefined }] });
+    const meta = await browserBackend.detectModelReasoning(provider.id, "test-coder");
+    expect(meta.nativeParamKind).toBe("unknown");
+    // null 是"无法确认"，不是 false。写成 false 就是把未探明伪装成探测结论。
+    expect(meta.builtinTiersCompatible ?? null).toBeNull();
+    // 形态未知时不报协议：报了会让界面以为档位在这个端点一定写得出参数。
+    expect(meta.supportedProtocols).toEqual([]);
+  });
+
+  it("已探到不支持：builtinTiersCompatible 为 false，与 unknown 分得开", async () => {
+    const { backend: browserBackend } = await import("./backend");
+    const unsupported = { ...capability, support: "unsupported" as const, tiers: [], control: { kind: "none" as const } };
+    const provider = seedProvider({ models: [{ ...model, reasoning: unsupported }] });
+    const meta = await browserBackend.detectModelReasoning(provider.id, "test-coder");
+    expect(meta.builtinTiersCompatible).toBe(false);
   });
 });
 

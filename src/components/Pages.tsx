@@ -2,7 +2,7 @@ import * as Switch from "@radix-ui/react-switch";
 import * as Dialog from "@radix-ui/react-dialog";
 import { AlertTriangle, Check, CircleX, Clipboard, Download, FileClock, Gauge, Info, ListRestart, LoaderCircle, MessageCircle, Play, Plus, RefreshCw, RotateCcw, Save, ShieldCheck, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { AppSettings, ClientDescriptor, CustomReasoningTier, LaunchOutcome, Provider, ProviderTestReport, ReasoningFallback, ReasoningLevel, ReasoningNameRule } from "../domain/types";
+import type { AppSettings, ClientDescriptor, CustomReasoningTier, LaunchOutcome, NameMatchType, Provider, ProviderTestReport, ReasoningFallback, ReasoningLevel, ReasoningNameRule } from "../domain/types";
 import { legacyReasoningLevels } from "../domain/types";
 import { activeOption, builtinReasoningTiers, confidenceLabel, effectiveFallbackTier, isFallbackOrigin, originLabel, reasoningOrigin, reasoningUiState, removeFallback, resolveTierLabel, selectionFor, stateMessage, upsertFallback } from "../domain/reasoning";
 import { backend } from "../services/backend";
@@ -203,16 +203,37 @@ function CustomTierEditor({ tiers, rules, fallbacks, onChange }: { tiers: Custom
   </div>;
 }
 
+/** 从模型卡片打开弹窗时带进来的规则预填。`pattern` 为空表示不预填。 */
+export interface TierRuleDraft {
+  pattern: string;
+  matchType: NameMatchType;
+}
+
 /**
  * 新建 / 编辑档位对话框。
  *
  * 三个协议参数都是自由 JSON 文本，只校验"能不能解析"，不校验字段语义：本项目不维护
  * 各家网关的参数字典，一旦校验就等于替用户判断哪些参数合法，而那正是该由网关回答的事。
  * 参数原样存盘、原样写出，程序不改写一个字节。
+ *
+ * 从设置页与从模型卡片打开的是**同一个组件**：两个入口两套弹窗，校验规则和文案迟早分叉。
+ * 差别只在 `prefillRule` —— 给了就多渲染一个「匹配规则」字段，`onSave` 时把规则一起交出去。
  */
-function CustomTierDialog({ tier, existing, onCancel, onSave }: { tier: CustomReasoningTier; existing: CustomReasoningTier[]; onCancel(): void; onSave(next: CustomReasoningTier): void }) {
+export function CustomTierDialog({ tier, existing, prefillRule, onCancel, onSave }: {
+  tier: CustomReasoningTier;
+  existing: CustomReasoningTier[];
+  /**
+   * 预填的模型名匹配规则。**只是预填**：用户可以改写，也可以清空后照样保存——
+   * 清空就表示"这个档位先建着，规则我自己去设置页配"，不该被强制拦住。
+   */
+  prefillRule?: TierRuleDraft;
+  onCancel(): void;
+  /** `rule` 只在渲染了规则字段且用户没清空时给出。 */
+  onSave(next: CustomReasoningTier, rule?: TierRuleDraft): void;
+}) {
   const [label, setLabel] = useState(tier.label);
   const [description, setDescription] = useState(tier.description ?? "");
+  const [rule, setRule] = useState<TierRuleDraft | undefined>(prefillRule);
   const [text, setText] = useState<Record<ProtocolFieldKey, string>>(() => ({
     openaiParams: tier.openaiParams == null ? "" : JSON.stringify(tier.openaiParams, null, 2),
     anthropicParams: tier.anthropicParams == null ? "" : JSON.stringify(tier.anthropicParams, null, 2),
@@ -241,7 +262,9 @@ function CustomTierDialog({ tier, existing, onCancel, onSave }: { tier: CustomRe
     if (problems.length > 0 || invalid.length > 0) return;
     const next: CustomReasoningTier = { ...tier, label: label.trim(), description: description.trim() || null };
     for (const item of parsed) next[item.key] = item.value;
-    onSave(next);
+    // 规则被清成空白就当没填：空 pattern 会命中一切模型，存下去比不存危险得多。
+    const trimmed = rule && rule.pattern.trim() ? { ...rule, pattern: rule.pattern.trim() } : undefined;
+    onSave(next, trimmed);
   };
 
   return <Dialog.Root open onOpenChange={(open) => { if (!open) onCancel(); }}>
@@ -261,6 +284,23 @@ function CustomTierDialog({ tier, existing, onCancel, onSave }: { tier: CustomRe
             {state?.error && <small className="field-error">{state.error}</small>}
           </label>;
         })}
+        {rule && <div className="form-grid">
+          <label>模型名匹配规则<input
+            value={rule.pattern}
+            aria-label="模型名匹配规则"
+            placeholder="留空则只建档位、不建规则"
+            onChange={(event) => setRule({ ...rule, pattern: event.target.value })}
+          /></label>
+          <label>匹配方式<select
+            aria-label="匹配方式"
+            value={rule.matchType}
+            onChange={(event) => setRule({ ...rule, matchType: event.target.value as NameMatchType })}
+          >
+            <option value="prefix">前缀匹配</option>
+            <option value="contains">包含匹配</option>
+          </select></label>
+        </div>}
+        {rule && <p className="section-note">规则预填自当前模型名，可以改写成更宽的写法覆盖同系列模型。清空后保存只建档位，不建规则。</p>}
         <p className="section-note">参数按你写的原样存盘、原样写入配置文件，程序不校验字段名也不改写取值。留空的协议在结算时跳过这一级。</p>
         {problems.map((problem) => <p className="field-error" key={problem}>{problem}</p>)}
         <div className="dialog-actions">

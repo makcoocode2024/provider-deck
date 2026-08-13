@@ -28,7 +28,10 @@ use tauri::{
 use uuid::Uuid;
 use error::{AppError, AppResult};
 use chat_store::{ChatBackupRecord, ChatCacheSummary, ChatRestoreMode, ChatRestoreResult, ChatStore};
-use model::{AppSettings, ApplyResult, BackupRecord, ClientDescriptor, ConfigChange, ProbeResult, Provider, ProviderDraft, ProviderTestReport};
+use model::{
+    AppSettings, ApplyResult, BackupRecord, ClientDescriptor, ConfigChange, MatchedCustomTier, ModelReasoningMeta,
+    ProbeResult, Provider, ProviderDraft, ProviderTestReport, ReasoningDetectionCacheEntry,
+};
 use local_proxy::LocalProxy;
 use storage::StateStore;
 
@@ -339,6 +342,94 @@ async fn reprobe_model_reasoning(store: State<'_, StateStore>, provider_id: Stri
         true,
     );
     Ok(refreshed)
+}
+
+/// 汇总某个模型在某个端点上的推理档位可选面，供界面一次取齐。
+///
+/// **本函数不发出站请求。** 它只投影本机已有的数据：能力结论读 `ModelInfo.reasoning`，
+/// 适配档位读 `AppSettings` 里用户自己写的规则表。要真的重新探测走
+/// [`reprobe_model_reasoning`]（那条链路才有 Tier 0/1/2 与 TTL 退避），
+/// 前端在重探成功后再调一次本命令刷新展示即可。
+///
+/// 往这里加 HTTP 调用会形成第二套发现逻辑：它不写 evidence、不走 TTL，
+/// 迟早与 `reasoning_discovery` 的结论打架。
+#[tauri::command]
+fn detect_model_reasoning(
+    store: State<'_, StateStore>,
+    provider_id: String,
+    model_id: String,
+) -> AppResult<ModelReasoningMeta> {
+    let state = store.read();
+    let provider = state
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| AppError::ProviderNotFound(provider_id.clone()))?;
+    let protocol = provider.protocol;
+    // 归一化失败不算错误：base_url 可能是用户刚填的草稿。此时按原样比对，
+    // 最坏结果是缓存不命中、重算一次投影。
+    let base_url = protocol::normalize_base_url(&provider.base_url).unwrap_or_else(|_| provider.base_url.clone());
+
+    // 匹配档位每次实时算：用户改一条规则，缓存里的匹配结果立刻是脏的，而重算只是一次遍历。
+    let matched_custom_tiers: Vec<MatchedCustomTier> = reasoning_selection::matching_custom_tiers(&model_id, &state.settings)
+        .into_iter()
+        .map(|hit| MatchedCustomTier {
+            tier_id: hit.tier.id.clone(),
+            label: hit.tier.label.clone(),
+            rule_pattern: hit.rule.pattern.clone(),
+            rule_match_type: hit.rule.match_type,
+            supported_protocols: hit.tier.supported_protocols(),
+        })
+        .collect();
+
+    if let Some(entry) = reasoning_selection::detection_cache_hit(&state.settings, &base_url, &model_id) {
+        return Ok(ModelReasoningMeta {
+            supported_protocols: if entry.native_param_kind == model::NativeParamKind::Unknown {
+                Vec::new()
+            } else {
+                vec![protocol]
+            },
+            native_param_kind: entry.native_param_kind,
+            matched_custom_tiers,
+            builtin_tiers_compatible: entry.builtin_tiers_compatible,
+        });
+    }
+
+    let capability = provider
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .and_then(|model| model.reasoning.as_ref());
+    let native_param_kind = reasoning_selection::native_param_kind(capability);
+    let builtin_tiers_compatible = reasoning_selection::builtin_tiers_compatible(capability);
+    drop(state);
+
+    // 回写缓存失败不该让查询失败：缓存只是省一次遍历，落盘出错时返回刚算出的投影即可。
+    let _ = store.update(|state| {
+        reasoning_selection::upsert_detection_cache(
+            &mut state.settings,
+            ReasoningDetectionCacheEntry {
+                base_url: base_url.clone(),
+                model_id: model_id.clone(),
+                detected_at: Utc::now().to_rfc3339(),
+                ttl_seconds: reasoning_capability::TTL_UNKNOWN_SECONDS,
+                native_param_kind,
+                builtin_tiers_compatible,
+            },
+        );
+        Ok(())
+    });
+
+    Ok(ModelReasoningMeta {
+        supported_protocols: if native_param_kind == model::NativeParamKind::Unknown {
+            Vec::new()
+        } else {
+            vec![protocol]
+        },
+        native_param_kind,
+        matched_custom_tiers,
+        builtin_tiers_compatible,
+    })
 }
 
 #[tauri::command]
@@ -686,7 +777,7 @@ pub fn run() {
     })
     .manage(store).manage(proxy).manage(chats).invoke_handler(tauri::generate_handler![
         list_providers, get_provider_api_key, save_provider, delete_provider, set_current_provider, probe_provider, reprobe_provider, detect_clients, launch_client,
-        refresh_provider_models, reprobe_model_reasoning, verify_model_reasoning, test_provider,
+        refresh_provider_models, reprobe_model_reasoning, detect_model_reasoning, verify_model_reasoning, test_provider,
         preview_changes, apply_changes, list_backups, restore_backup, get_settings, save_settings,
         list_chat_backups, chat_cache_summary, export_chat_backup, restore_chat_backup_file, restore_chat_backup_payload, restore_chat_cache, rollback_chat_restore,
         export_providers, import_providers, diagnostics

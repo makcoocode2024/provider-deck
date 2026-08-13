@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type {
   CustomReasoningTier,
+  MatchedCustomTier,
+  ModelReasoningMeta,
   ReasoningCapability,
   ReasoningFallback,
   ReasoningLevel,
@@ -24,6 +26,7 @@ import {
   hasDynamicBudget,
   latestVerification,
   latestVerificationForTier,
+  makeSelection,
   matchNameRule,
   originLabel,
   reasoningOrigin,
@@ -31,11 +34,13 @@ import {
   removeFallback,
   resolveTierLabel,
   tierOptions,
+  tierPickerGroups,
   upsertFallback,
   verifiableTier,
   verificationSummary,
   verificationTierLabel,
   verificationsFor,
+  writeTargetSummary,
 } from "./reasoning";
 
 describe("reasoningUiState", () => {
@@ -532,5 +537,187 @@ describe("自定义档位与模型名规则", () => {
   it("内置档位清单是封闭的五档，顺序固定", () => {
     expect(builtinReasoningTiers.map((tier) => tier.id)).toEqual(["off", "light", "standard", "deep", "max"]);
     expect(builtinReasoningTiers.map((tier) => tier.label)).toEqual(["关闭", "轻度", "中度", "高", "最大"]);
+  });
+});
+
+// —— 档位下拉的分组。
+//
+// 这一组钉住三件事：段序固定、空段不产出、`meta` 缺失不退化成"不支持"。
+// 所有 label 必须来自入参，任何一条断言里都不该出现本模块自造的档位名。
+
+describe("tierPickerGroups", () => {
+  const unknownCapability: ReasoningCapability = { ...supportedCapability, support: "unknown", tiers: [], confidence: "unknown" };
+  const meta = (extra: Partial<ModelReasoningMeta> = {}): ModelReasoningMeta => ({
+    supportedProtocols: ["openai"],
+    nativeParamKind: "effort-enum",
+    matchedCustomTiers: [],
+    ...extra,
+  });
+  const matched: MatchedCustomTier[] = [
+    { tierId: "tier-x", label: "超深", rulePattern: "test-", ruleMatchType: "prefix", supportedProtocols: ["openai", "azure-openai", "custom"] },
+    { tierId: "tier-y", label: "极限", rulePattern: "coder", ruleMatchType: "contains", supportedProtocols: ["anthropic"] },
+  ];
+  const state: FallbackSettings = { effectiveReasoningLevel: "medium" };
+
+  it("三段顺序固定，且匹配段保留用户规则表的顺序", () => {
+    const groups = tierPickerGroups(unknownCapability, meta({ matchedCustomTiers: matched }), state);
+    expect(groups.map((group) => group.kind)).toEqual(["matched-custom", "builtin", "global-fallback"]);
+    expect(groups[0].items.map((item) => item.id)).toEqual(["tier-x", "tier-y"]);
+    // 顺序颠倒，输出跟着变——顺序是用户表达的优先级，本函数不重排。
+    const reversed = tierPickerGroups(unknownCapability, meta({ matchedCustomTiers: [matched[1], matched[0]] }), state);
+    expect(reversed[0].items.map((item) => item.id)).toEqual(["tier-y", "tier-x"]);
+  });
+
+  it("匹配段带命中说明，措辞取自规则本身", () => {
+    const groups = tierPickerGroups(unknownCapability, meta({ matchedCustomTiers: matched }), state);
+    expect(groups[0].items[0].hint).toBe("test- · 前缀匹配");
+    expect(groups[0].items[1].hint).toBe("coder · 包含匹配");
+  });
+
+  it("空段不产出：没有匹配档位时不出现空的匹配段标题", () => {
+    expect(tierPickerGroups(unknownCapability, meta(), state).map((group) => group.kind)).toEqual(["builtin", "global-fallback"]);
+    expect(tierPickerGroups(unknownCapability, undefined, state).map((group) => group.kind)).toEqual(["builtin", "global-fallback"]);
+  });
+
+  it("不传 settings 就不产出全局回退段：那一段的取值只能来自设置表", () => {
+    expect(tierPickerGroups(unknownCapability, meta(), undefined).map((group) => group.kind)).toEqual(["builtin"]);
+  });
+
+  it("已探到不支持：摘掉匹配段，用户设定推翻不了探测事实", () => {
+    const unsupported: ReasoningCapability = { ...unknownCapability, support: "unsupported" };
+    const groups = tierPickerGroups(unsupported, meta({ matchedCustomTiers: matched }), state);
+    expect(groups.map((group) => group.kind)).toEqual(["builtin", "global-fallback"]);
+  });
+
+  it("已探明支持：内置段来自 capability.tiers，全部可写", () => {
+    const groups = tierPickerGroups(supportedCapability, meta(), state);
+    const builtin = groups.find((group) => group.kind === "builtin");
+    expect(builtin?.items.map((item) => item.label)).toEqual(supportedCapability.tiers.map((tier) => tier.label));
+    expect(builtin?.items.every((item) => item.writable)).toBe(true);
+  });
+
+  it("未探明：内置段的可写性由 builtinTiersCompatible 三态决定，null 不算可写", () => {
+    const writable = tierPickerGroups(unknownCapability, meta({ builtinTiersCompatible: true }), state);
+    expect(writable.find((group) => group.kind === "builtin")?.items.every((item) => item.writable)).toBe(true);
+    for (const value of [undefined, null, false] as const) {
+      const groups = tierPickerGroups(unknownCapability, meta({ builtinTiersCompatible: value }), state);
+      // null / undefined 是"无法确认"，标成可写就是在替探测下结论。
+      expect(groups.find((group) => group.kind === "builtin")?.items.some((item) => item.writable)).toBe(false);
+    }
+  });
+
+  it("档位与当前端点协议无交集时标为不可写，但不从列表里摘掉", () => {
+    const groups = tierPickerGroups(unknownCapability, meta({ matchedCustomTiers: matched, supportedProtocols: ["anthropic"] }), state);
+    expect(groups[0].items.map((item) => [item.id, item.writable])).toEqual([["tier-x", false], ["tier-y", true]]);
+  });
+
+  it("端点协议未探明时不断言不可写：只要档位填了参数就算可写", () => {
+    const groups = tierPickerGroups(unknownCapability, meta({ matchedCustomTiers: matched, supportedProtocols: [] }), state);
+    expect(groups[0].items.every((item) => item.writable)).toBe(true);
+  });
+
+  it("档位名留空时退回 id，不显示成空白", () => {
+    const blank: MatchedCustomTier[] = [{ ...matched[0], label: "  " }];
+    const groups = tierPickerGroups(unknownCapability, meta({ matchedCustomTiers: blank }), state);
+    expect(groups[0].items[0].label).toBe("tier-x");
+  });
+
+  it("全局回退段展示旧枚举原始取值，不翻译", () => {
+    for (const level of ["low", "medium", "high"] as ReasoningLevel[]) {
+      const groups = tierPickerGroups(unknownCapability, meta(), { effectiveReasoningLevel: level });
+      expect(groups.find((group) => group.kind === "global-fallback")?.items[0].label).toBe(level);
+    }
+  });
+});
+
+// —— 配置写入场景的文案。
+//
+// 这一组是"两处界面措辞一致"的可验证形式：文案只有这一处实现，
+// `ReasoningTierPicker` 与 `ConfigPreview` 都取它的返回值。
+//
+// 断言的核心不是具体字句，而是**设定性取值绝不使用事实性措辞**。
+
+describe("writeTargetSummary", () => {
+  const unknownCapability: ReasoningCapability = { ...supportedCapability, support: "unknown", tiers: [], confidence: "unknown" };
+  const customTier: CustomReasoningTier = { id: "tier-x", label: "超深", openaiParams: { reasoning: { effort: "xhigh" } } };
+  const base = (extra: Partial<FallbackSettings> = {}): FallbackSettings =>
+    ({ effectiveReasoningLevel: "medium", ...extra });
+
+  it("已探明：场景为 builtin，档位名来自 capability.tiers", () => {
+    const summary = writeTargetSummary(supportedCapability, undefined, base(), "test-coder");
+    expect(summary?.scene).toBe("builtin");
+    expect(summary?.tier).toBe(supportedCapability.tiers.find((tier) => tier.tier === supportedCapability.defaultTier)?.label);
+    expect(summary?.custom).toBe(false);
+    expect(summary?.message).toContain("已探明档位");
+  });
+
+  it("已探明且用户选了另一档：跟随选择，不停留在默认档", () => {
+    const other = supportedCapability.tiers.find((tier) => tier.tier !== supportedCapability.defaultTier);
+    const selection = makeSelection("test-coder", other!.tier);
+    expect(writeTargetSummary(supportedCapability, undefined, base(), "test-coder", selection)?.tier).toBe(other?.label);
+  });
+
+  it("已探到不支持 / 无可用档位：不产出任何写入说明", () => {
+    for (const capability of [
+      { ...unknownCapability, support: "unsupported" } as ReasoningCapability,
+      { ...unknownCapability, support: "supported" } as ReasoningCapability, // supported 但 tiers 为空 = empty
+    ]) {
+      expect(writeTargetSummary(capability, undefined, base(), "test-coder")).toBeUndefined();
+    }
+  });
+
+  it("缺 settings 时不产出：全局回退档的取值只能来自设置表", () => {
+    expect(writeTargetSummary(unknownCapability, undefined, undefined, "test-coder")).toBeUndefined();
+  });
+
+  it("三级兜底都映射成 matched-custom 场景：用户看到的结论一样", () => {
+    const model = base({ reasoningFallbacks: [{ modelId: "test-coder", tierId: "light" }] });
+    expect(writeTargetSummary(unknownCapability, undefined, model, "test-coder")).toMatchObject({
+      scene: "matched-custom", tier: "轻度", custom: false,
+    });
+    const rule = base({
+      customReasoningTiers: [customTier],
+      reasoningNameRules: [{ id: "r", pattern: "test-", matchType: "prefix", tierId: "tier-x" }],
+    });
+    expect(writeTargetSummary(unknownCapability, undefined, rule, "test-coder")).toMatchObject({
+      scene: "matched-custom", tier: "超深", custom: true,
+    });
+  });
+
+  it("无任何匹配：落到 global-fallback，措辞点明可新建档位", () => {
+    const summary = writeTargetSummary(unknownCapability, undefined, base(), "test-coder");
+    expect(summary?.scene).toBe("global-fallback");
+    expect(summary?.tier).toBe("medium");
+    expect(summary?.message).toBe("配置写入：medium · 全局回退档（未探测，可新建自定义档位适配此模型）");
+  });
+
+  it("设定性场景不使用事实性措辞，已探明场景才允许说「已探明」", () => {
+    const factual = ["支持", "兼容", "已确认", "已验证", "已探明"];
+    for (const state of [
+      base(),
+      base({ reasoningFallbacks: [{ modelId: "test-coder", tierId: "light" }] }),
+    ]) {
+      const summary = writeTargetSummary(unknownCapability, undefined, state, "test-coder");
+      for (const word of factual) expect(summary?.message).not.toContain(word);
+      expect(summary?.message).toContain("未探测");
+    }
+    expect(writeTargetSummary(supportedCapability, undefined, base(), "test-coder")?.message).toContain("已探明");
+  });
+
+  it("每个场景都注明只影响配置写出：实时链路不发推理参数", () => {
+    for (const capability of [supportedCapability, unknownCapability]) {
+      const summary = writeTargetSummary(capability, undefined, base(), "test-coder");
+      expect(summary?.scopeNote).toBe("仅用于写入配置文件，实时请求不发送推理参数。");
+    }
+  });
+
+  it("兜底场景与 fallbackNotice 结算出同一个档位：三级降级只有一处实现", () => {
+    const state = base({
+      reasoningFallbacks: [{ modelId: "test-coder", tierId: "deleted" }],
+      customReasoningTiers: [customTier],
+      reasoningNameRules: [{ id: "r", pattern: "test-", matchType: "prefix", tierId: "tier-x" }],
+    });
+    expect(writeTargetSummary(unknownCapability, undefined, state, "test-coder")?.tier)
+      .toBe(fallbackNotice(unknownCapability, state, "test-coder")?.tier);
   });
 });

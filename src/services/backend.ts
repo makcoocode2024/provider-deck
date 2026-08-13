@@ -10,8 +10,12 @@ import type {
   ChatRestoreResult,
   ClientDescriptor,
   ConfigChange,
+  MatchedCustomTier,
+  ModelReasoningMeta,
+  NativeParamKind,
   ProbeResult,
   LaunchOutcome,
+  ProtocolKind,
   Provider,
   ProviderDraft,
   ProviderTestReport,
@@ -102,6 +106,14 @@ export interface AppBackend {
   /** 单模型级重新探测推理能力。绕过 TTL，只影响该模型。 */
   reprobeModelReasoning(providerId: string, modelId: string): Promise<Provider>;
   /**
+   * 汇总某个模型的推理档位可选面。**不发出站请求**，只投影本机已有数据。
+   *
+   * 与 {@link reprobeModelReasoning} 的分工：那个会真的发探测请求并改写
+   * `ModelInfo.reasoning`；这个只读能力表与用户规则表，返回展示所需的投影。
+   * 重探成功后再调一次本方法刷新展示。
+   */
+  detectModelReasoning(providerId: string, modelId: string): Promise<ModelReasoningMeta>;
+  /**
    * 运行时验证某个档位是否真的生效。**会发出一次真实计费请求。**
    *
    * 只收 tier：binding 由后端从能力表派生（`reasoning_verification.rs:82`），
@@ -144,6 +156,8 @@ class TauriBackend implements AppBackend {
   reprobeProvider = (id: string) => invoke<Provider>("reprobe_provider", { id });
   refreshProviderModels = (id: string) => invoke<Provider>("refresh_provider_models", { providerId: id });
   reprobeModelReasoning = (providerId: string, modelId: string) => invoke<Provider>("reprobe_model_reasoning", { providerId, modelId });
+  detectModelReasoning = (providerId: string, modelId: string) =>
+    invoke<ModelReasoningMeta>("detect_model_reasoning", { providerId, modelId });
   // 参数名保持 camelCase：Tauri 2 按 camelCase → snake_case 匹配 command 形参，
   // 写成 provider_id 会导致 invoke 报参数缺失。
   verifyModelReasoning = (providerId: string, modelId: string, tier: ReasoningTier) =>
@@ -329,6 +343,75 @@ class BrowserBackend implements AppBackend {
     };
     localStorage.setItem(this.providerKey, JSON.stringify(providers.map((item) => item.id === providerId ? refreshed : item)));
     return refreshed;
+  }
+
+  /**
+   * 测试后端的探测投影。**不发任何请求**，与真实后端同一个语义。
+   *
+   * 三份推导逐条对齐 Rust：匹配档位对齐 `matching_custom_tiers`（表序、跳空 pattern、
+   * 跳已删档位、跳内置档位 id、同档位去重），参数类别对齐 `native_param_kind`
+   * （只看 control），内置兼容性对齐 `builtin_tiers_compatible`（三态）。
+   *
+   * 这三段推导刻意留在测试后端内部而不是提到 domain 层：domain 层的函数真实 UI 也能
+   * 调到，一旦有人在真实路径里调它，界面就会绕过后端自己算匹配档位，那正是本次要
+   * 避免的"两处各算一遍"。
+   */
+  async detectModelReasoning(providerId: string, modelId: string): Promise<ModelReasoningMeta> {
+    this.ensureTestMode();
+    const providers = await this.listProviders();
+    const provider = providers.find((item) => item.id === providerId);
+    if (!provider) throw new Error(`未找到服务：${providerId}`);
+    const settings = await this.getSettings();
+    const capability = provider.models.find((item) => item.id === modelId)?.reasoning;
+
+    const target = modelId.trim().toLowerCase();
+    const matchedCustomTiers: MatchedCustomTier[] = [];
+    if (target) {
+      for (const rule of settings.reasoningNameRules ?? []) {
+        const pattern = rule.pattern.trim().toLowerCase();
+        if (!pattern) continue;
+        const hit = rule.matchType === "contains" ? target.includes(pattern) : target.startsWith(pattern);
+        if (!hit) continue;
+        const tier = (settings.customReasoningTiers ?? []).find((item) => item.id === rule.tierId);
+        if (!tier) continue;
+        if (matchedCustomTiers.some((item) => item.tierId === tier.id)) continue;
+        const supportedProtocols: ProtocolKind[] = [];
+        if (tier.openaiParams !== undefined && tier.openaiParams !== null) {
+          supportedProtocols.push("openai", "azure-openai", "custom");
+        }
+        if (tier.anthropicParams !== undefined && tier.anthropicParams !== null) supportedProtocols.push("anthropic");
+        if (tier.geminiParams !== undefined && tier.geminiParams !== null) supportedProtocols.push("gemini");
+        matchedCustomTiers.push({
+          tierId: tier.id,
+          label: tier.label,
+          rulePattern: rule.pattern,
+          ruleMatchType: rule.matchType,
+          supportedProtocols,
+        });
+      }
+    }
+
+    const nativeParamKind: NativeParamKind =
+      !capability || capability.support !== "supported" ? "unknown"
+      : capability.control.kind === "effortEnum" ? "effort-enum"
+      : capability.control.kind === "tokenBudget" ? "token-budget"
+      : capability.control.kind === "booleanToggle" ? "boolean-toggle"
+      : "unknown";
+
+    // 三态：未探明必须是 null，写成 false 会把"不知道"伪装成"不兼容"。
+    const builtinTiersCompatible =
+      !capability ? null
+      : capability.support === "unsupported" ? false
+      : capability.support === "unknown" ? null
+      : capability.control.kind === "effortEnum" && capability.tiers.length > 0 ? true
+      : null;
+
+    return {
+      supportedProtocols: nativeParamKind === "unknown" ? [] : [provider.protocol],
+      nativeParamKind,
+      matchedCustomTiers,
+      builtinTiersCompatible,
+    };
   }
 
   /**

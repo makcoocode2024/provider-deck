@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AppSettings,
   ModelInfo,
+  ModelReasoningMeta,
   Provider,
   ProviderDraft,
   ReasoningCapability,
@@ -10,12 +11,16 @@ import type {
   VerificationResult,
 } from "../domain/types";
 import { defaultSettings } from "../domain/types";
-import { normalizeProviderDraft, useAppStore } from "./useAppStore";
+import { normalizeProviderDraft, reasoningMetaKey, useAppStore } from "./useAppStore";
 
-const mocks = vi.hoisted(() => ({ saveSettings: vi.fn(), verifyModelReasoning: vi.fn() }));
+const mocks = vi.hoisted(() => ({ saveSettings: vi.fn(), verifyModelReasoning: vi.fn(), detectModelReasoning: vi.fn() }));
 
 vi.mock("../services/backend", () => ({
-  backend: { saveSettings: mocks.saveSettings, verifyModelReasoning: mocks.verifyModelReasoning },
+  backend: {
+    saveSettings: mocks.saveSettings,
+    verifyModelReasoning: mocks.verifyModelReasoning,
+    detectModelReasoning: mocks.detectModelReasoning,
+  },
 }));
 
 const draft = (protocolHint: ProviderDraft["protocolHint"]): ProviderDraft => ({
@@ -147,6 +152,89 @@ function verification(tier: ReasoningTier, result: VerificationResult, verifiedA
     protocol: "openai",
   };
 }
+
+// —— 档位可选面的投影。
+//
+// 这一组钉住的是**边界**：本 action 只写 reasoningMeta / detectingReasoning 两个字段，
+// providers 一个字节都不动，失败也不弹全局错误。
+
+describe("detectModelReasoning", () => {
+  const meta: ModelReasoningMeta = {
+    supportedProtocols: ["openai"],
+    nativeParamKind: "effort-enum",
+    matchedCustomTiers: [],
+    builtinTiersCompatible: true,
+  };
+
+  beforeEach(() => {
+    mocks.detectModelReasoning.mockReset();
+    useAppStore.setState({
+      providers: [provider()], operation: undefined, error: undefined,
+      reasoningMeta: {}, detectingReasoning: {},
+    });
+  });
+
+  it("成功后按 (providerId, modelId) 入缓存，并收尾 detecting 标记", async () => {
+    mocks.detectModelReasoning.mockResolvedValue(meta);
+
+    const returned = await useAppStore.getState().detectModelReasoning("p1", "test-coder");
+
+    expect(mocks.detectModelReasoning).toHaveBeenCalledWith("p1", "test-coder");
+    expect(returned).toEqual(meta);
+    expect(useAppStore.getState().reasoningMeta[reasoningMetaKey("p1", "test-coder")]).toEqual(meta);
+    expect(useAppStore.getState().detectingReasoning[reasoningMetaKey("p1", "test-coder")]).toBe(false);
+  });
+
+  it("不碰 providers：models 与 reasoningVerifications 一个字节都不动", async () => {
+    const before = useAppStore.getState().providers;
+    mocks.detectModelReasoning.mockResolvedValue(meta);
+
+    await useAppStore.getState().detectModelReasoning("p1", "test-coder");
+
+    // 同一个引用：本 action 压根没重建 providers 数组。
+    expect(useAppStore.getState().providers).toBe(before);
+  });
+
+  it("失败时不置全局 error、不清已有缓存，返回 undefined", async () => {
+    const key = reasoningMetaKey("p1", "test-coder");
+    useAppStore.setState({ reasoningMeta: { [key]: meta } });
+    mocks.detectModelReasoning.mockRejectedValue(new Error("boom"));
+
+    const returned = await useAppStore.getState().detectModelReasoning("p1", "test-coder");
+
+    expect(returned).toBeUndefined();
+    // 探测失败不代表用户的档位配置没了：上一次的投影原样留着。
+    expect(useAppStore.getState().reasoningMeta[key]).toEqual(meta);
+    expect(useAppStore.getState().error).toBeUndefined();
+    expect(useAppStore.getState().operation).toBeUndefined();
+    expect(useAppStore.getState().detectingReasoning[key]).toBe(false);
+  });
+
+  it("两个模型的投影互不覆盖", async () => {
+    mocks.detectModelReasoning.mockResolvedValueOnce(meta);
+    await useAppStore.getState().detectModelReasoning("p1", "test-coder");
+    const other: ModelReasoningMeta = { ...meta, nativeParamKind: "token-budget" };
+    mocks.detectModelReasoning.mockResolvedValueOnce(other);
+    await useAppStore.getState().detectModelReasoning("p1", "other-model");
+
+    expect(useAppStore.getState().reasoningMeta[reasoningMetaKey("p1", "test-coder")]).toEqual(meta);
+    expect(useAppStore.getState().reasoningMeta[reasoningMetaKey("p1", "other-model")]).toEqual(other);
+  });
+
+  it("任何分隔符都可能出现在 id 里，键仍与两个入参一一对应", () => {
+    // 冒号、斜杠、空格都能在 modelId 里合法出现，逐一钉住不许撞车。
+    expect(reasoningMetaKey("p1", "vendor:model")).not.toBe(reasoningMetaKey("p1:vendor", "model"));
+    expect(reasoningMetaKey("p", "1:vendor:model")).not.toBe(reasoningMetaKey("p1", "vendor:model"));
+    expect(reasoningMetaKey("a", "b/c")).not.toBe(reasoningMetaKey("a/b", "c"));
+    expect(reasoningMetaKey("a", "b c")).not.toBe(reasoningMetaKey("a b", "c"));
+  });
+
+  it("缺 providerId 或 modelId 时不发请求", async () => {
+    expect(await useAppStore.getState().detectModelReasoning("", "test-coder")).toBeUndefined();
+    expect(await useAppStore.getState().detectModelReasoning("p1", "")).toBeUndefined();
+    expect(mocks.detectModelReasoning).not.toHaveBeenCalled();
+  });
+});
 
 describe("verifyModelReasoning", () => {
   beforeEach(() => {

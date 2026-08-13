@@ -2,6 +2,7 @@
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { describe, expect, it, vi, afterEach } from "vitest";
 import type {
+  ModelReasoningMeta,
   ReasoningCapability,
   ReasoningSelection,
   ReasoningTier,
@@ -9,7 +10,7 @@ import type {
   VerificationResult,
 } from "../domain/types";
 import type { FallbackSettings } from "../domain/reasoning";
-import { fallbackNotice } from "../domain/reasoning";
+import { tierPickerGroups, writeTargetSummary } from "../domain/reasoning";
 import { ReasoningTierPicker } from "./ReasoningTierPicker";
 
 describe("ReasoningTierPicker", () => {
@@ -101,12 +102,12 @@ describe("ReasoningTierPicker", () => {
   });
 });
 
-// —— 兜底档位的展示。
+// —— 配置写入说明的展示。
 //
-// 这一组的共同前提：`fallback` 是第三个独立入参，既不来自 capability 也不来自
+// 这一组的共同前提：`writeTarget` 是独立入参，既不来自 capability 也不来自
 // verifications。断言的重点不是"显示了什么值"，而是"有没有把用户设定说成探测结论"。
 
-describe("ReasoningTierPicker 的兜底档位标记", () => {
+describe("ReasoningTierPicker 的配置写入说明", () => {
   afterEach(cleanup);
   const unknownCapability: ReasoningCapability = {
     key: { baseUrl: "https://api.example.com/v1", modelId: "test-coder" },
@@ -124,11 +125,14 @@ describe("ReasoningTierPicker 的兜底档位标记", () => {
     reasoningFallbacks: [{ modelId: "test-coder", tierId: "deep" }],
   };
 
-  it("未探明时显示兜底档位，并注明是用户设定", () => {
-    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={fallbackNotice(unknownCapability, settings, "test-coder")} />);
+  const target = (state: FallbackSettings, capability = unknownCapability) =>
+    writeTargetSummary(capability, undefined, state, "test-coder");
+
+  it("未探明时说明配置会写入哪一档，并注明是用户设定", () => {
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} writeTarget={target(settings)} />);
     expect(screen.getByText("能力未探明")).toBeInTheDocument();
     expect(screen.getByText("高")).toBeInTheDocument();
-    expect(screen.getByText(/单模型兜底档位：高（仅配置生效）/)).toBeInTheDocument();
+    expect(screen.getByText(/配置写入：高 · 命中你设定的档位（未探测）/)).toBeInTheDocument();
     expect(screen.getByText(/仅用于写入配置文件/)).toBeInTheDocument();
   });
 
@@ -138,48 +142,164 @@ describe("ReasoningTierPicker 的兜底档位标记", () => {
       customReasoningTiers: [{ id: "tier-x", label: "超深", openaiParams: { reasoning: { effort: "xhigh" } } }],
       reasoningNameRules: [{ id: "r", pattern: "test-", matchType: "prefix", tierId: "tier-x" }],
     };
-    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={fallbackNotice(unknownCapability, custom, "test-coder")} />);
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} writeTarget={target(custom)} />);
     expect(screen.getByText("超深")).toBeInTheDocument();
     expect(screen.getByText(/自定义/)).toBeInTheDocument();
-    expect(screen.getByText(/名称规则兜底：超深（仅配置生效）/)).toBeInTheDocument();
+    expect(screen.getByText(/配置写入：超深 · 命中你设定的档位（未探测）/)).toBeInTheDocument();
 
     cleanup();
-    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={fallbackNotice(unknownCapability, settings, "test-coder")} />);
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} writeTarget={target(settings)} />);
     expect(screen.queryByText(/自定义/)).not.toBeInTheDocument();
   });
 
-  it("兜底文案不出现任何事实性措辞", () => {
-    const notice = fallbackNotice(unknownCapability, settings, "test-coder");
-    // 「支持/兼容/已确认」会让用户以为自己填的档位得到了服务端确认。
-    for (const word of ["支持", "兼容", "已确认"]) {
-      expect(notice?.message).not.toContain(word);
+  it("设定性场景的文案不出现任何事实性措辞", () => {
+    // 「支持/兼容/已确认/已验证/已探明」会让用户以为自己填的档位得到了服务端确认。
+    for (const state of [settings, { effectiveReasoningLevel: "medium" } as FallbackSettings]) {
+      const summary = target(state);
+      for (const word of ["支持", "兼容", "已确认", "已验证", "已探明"]) {
+        expect(summary?.message).not.toContain(word);
+      }
+      expect(summary?.message).toContain("未探测");
+      expect(summary?.scopeNote).toContain("实时请求不发送推理参数");
     }
-    expect(notice?.message).toContain("仅配置生效");
   });
 
-  it("兜底标记不出现 confidence 用词", () => {
-    const notice = fallbackNotice(unknownCapability, settings, "test-coder");
-    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={notice} />);
-    const note = screen.getByText(/单模型兜底档位/).closest("p");
+  it("设定性场景不出现 confidence 用词", () => {
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} writeTarget={target(settings)} />);
+    const note = screen.getByText(/配置写入：高/).closest("p");
     for (const word of ["服务端声明", "参数校验确认", "真实响应证实"]) {
       expect(note?.textContent).not.toContain(word);
     }
-    // 徽章本身不能自称已探明。整段文字里"探测成功后自动改用已探明档位"是对未来的
-    // 说明，不是对当前状态的断言，所以只对 label 做这条断言。
-    expect(notice?.label).not.toContain("已探明");
   });
 
-  it("已探明不支持：不渲染任何兜底提示", () => {
+  it("未探明且无匹配档位：落到全局回退档，措辞点明可新建档位", () => {
+    const summary = target({ effectiveReasoningLevel: "medium" });
+    expect(summary?.scene).toBe("global-fallback");
+    expect(summary?.message).toBe("配置写入：medium · 全局回退档（未探测，可新建自定义档位适配此模型）");
+  });
+
+  it("已探明不支持：不渲染任何写入说明", () => {
     const unsupported: ReasoningCapability = { ...unknownCapability, support: "unsupported" };
-    render(<ReasoningTierPicker capability={unsupported} onChange={vi.fn()} fallback={fallbackNotice(unsupported, settings, "test-coder")} />);
+    expect(target(settings, unsupported)).toBeUndefined();
+    render(<ReasoningTierPicker capability={unsupported} onChange={vi.fn()} writeTarget={target(settings, unsupported)} />);
     expect(screen.getByText("此模型不支持推理")).toBeInTheDocument();
-    expect(screen.queryByText(/兜底档位/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/配置写入/)).not.toBeInTheDocument();
     expect(screen.queryByText("高")).not.toBeInTheDocument();
   });
 
-  it("没有兜底入参时不多渲染一行", () => {
+  it("没有写入说明入参时不多渲染一行", () => {
     render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} />);
-    expect(screen.queryByText(/兜底档位/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/配置写入/)).not.toBeInTheDocument();
+  });
+});
+
+// —— 档位分组与探测中的形态。
+//
+// 这一组只断言"可选面怎么排、缺 meta 时会不会退化成不支持"，不断言任何探测结论。
+
+describe("ReasoningTierPicker 的档位分组", () => {
+  afterEach(cleanup);
+  const unknownCapability: ReasoningCapability = {
+    key: { baseUrl: "https://api.example.com/v1", modelId: "test-coder" },
+    support: "unknown",
+    control: { kind: "none" },
+    tiers: [],
+    constraints: {},
+    confidence: "unknown",
+    evidence: [],
+    discoveredAt: "2026-08-12T10:00:00Z",
+    ttlSeconds: 6 * 3600,
+  };
+  const meta: ModelReasoningMeta = {
+    supportedProtocols: ["openai"],
+    nativeParamKind: "token-budget",
+    matchedCustomTiers: [
+      { tierId: "tier-x", label: "超深", rulePattern: "test-", ruleMatchType: "prefix", supportedProtocols: ["openai"] },
+    ],
+  };
+  const settings: FallbackSettings = { effectiveReasoningLevel: "medium" };
+
+  it("三段按固定顺序出现：匹配档位 → 内置档位 → 全局回退档", () => {
+    const groups = tierPickerGroups(unknownCapability, meta, settings);
+    expect(groups.map((group) => group.kind)).toEqual(["matched-custom", "builtin", "global-fallback"]);
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} groups={groups} />);
+    expect(screen.getByText("匹配到的自定义档位")).toBeInTheDocument();
+    expect(screen.getByText("超深")).toBeInTheDocument();
+    expect(screen.getByText("test- · 前缀匹配")).toBeInTheDocument();
+  });
+
+  it("没有匹配档位时不出现空的匹配分组，并给出新建入口", () => {
+    const groups = tierPickerGroups(unknownCapability, undefined, settings);
+    expect(groups.map((group) => group.kind)).toEqual(["builtin", "global-fallback"]);
+    const onCreateTier = vi.fn();
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} groups={groups} onCreateTier={onCreateTier} />);
+    expect(screen.queryByText("匹配到的自定义档位")).not.toBeInTheDocument();
+    // 全局回退档仍要看得见：它就是此刻会写进配置的那一档。
+    expect(screen.getByText("全局回退档")).toBeInTheDocument();
+    expect(screen.getByText("medium")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /新建自定义档位/ }));
+    expect(onCreateTier).toHaveBeenCalledTimes(1);
+  });
+
+  it("已探明分支不重复列内置段：radio 列表就是它的可交互形态", () => {
+    const supported: ReasoningCapability = {
+      ...unknownCapability,
+      support: "supported",
+      control: { kind: "effortEnum", values: ["minimal", "xhigh"] },
+      tiers: [
+        { tier: "light", id: "light", label: "轻度推理", binding: { kind: "effort", value: "minimal" }, wireSummary: "effort=minimal" },
+      ],
+    };
+    const groups = tierPickerGroups(supported, meta, settings);
+    render(<ReasoningTierPicker capability={supported} onChange={vi.fn()} groups={groups} />);
+    // 分组区仍在（匹配段要看得见），但内置段的标题不出现第二次。
+    expect(screen.getByText("匹配到的自定义档位")).toBeInTheDocument();
+    expect(screen.queryByText("内置档位")).not.toBeInTheDocument();
+    expect(screen.getAllByText("轻度推理")).toHaveLength(1);
+  });
+
+  it("有匹配档位时不给新建入口：用户已经有可用档位了", () => {
+    const groups = tierPickerGroups(unknownCapability, meta, settings);
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} groups={groups} onCreateTier={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /新建自定义档位/ })).not.toBeInTheDocument();
+  });
+
+  it("已探到不支持：不出现匹配分组，也不给新建入口", () => {
+    const unsupported: ReasoningCapability = { ...unknownCapability, support: "unsupported" };
+    const groups = tierPickerGroups(unsupported, meta, settings);
+    expect(groups.some((group) => group.kind === "matched-custom")).toBe(false);
+    render(<ReasoningTierPicker capability={unsupported} onChange={vi.fn()} groups={groups} onCreateTier={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /新建自定义档位/ })).not.toBeInTheDocument();
+  });
+
+  it("档位在当前端点写不出参数时如实标注，但不隐藏该项", () => {
+    const otherProtocol: ModelReasoningMeta = {
+      ...meta,
+      supportedProtocols: ["anthropic"],
+    };
+    const groups = tierPickerGroups(unknownCapability, otherProtocol, settings);
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} groups={groups} />);
+    // 该项仍在列表里，只是多一行说明——隐藏会让用户以为档位没保存成功。
+    const row = screen.getByText("超深").closest("li");
+    expect(row).toBeInTheDocument();
+    expect(row?.textContent).toContain("当前端点无可写参数");
+  });
+
+  it("探测中：禁用控件但不清空档位，也不说不支持", () => {
+    const groups = tierPickerGroups(unknownCapability, meta, settings);
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} groups={groups} onCreateTier={vi.fn()} detecting />);
+    expect(screen.getByText("超深")).toBeInTheDocument();
+    expect(screen.queryByText("此模型不支持推理")).not.toBeInTheDocument();
+  });
+
+  it("原生参数形态为 unknown 时不渲染任何形态说明", () => {
+    const blank: ModelReasoningMeta = { supportedProtocols: [], nativeParamKind: "unknown", matchedCustomTiers: [] };
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} meta={blank} />);
+    expect(screen.queryByText(/推理参数/)).not.toBeInTheDocument();
+
+    cleanup();
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} meta={meta} />);
+    expect(screen.getByText(/token 预算数值/)).toBeInTheDocument();
   });
 });
 

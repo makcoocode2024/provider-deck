@@ -205,6 +205,107 @@ impl CustomReasoningTier {
     pub fn has_any_params(&self) -> bool {
         self.openai_params.is_some() || self.anthropic_params.is_some() || self.gemini_params.is_some()
     }
+
+    /// 这个档位为哪些协议配了参数。界面用它说明"该档位在当前端点是否有可写的表达"。
+    pub fn supported_protocols(&self) -> Vec<ProtocolKind> {
+        let mut kinds = Vec::new();
+        // OpenAI 系三个协议共用同一份参数（见 resolve_tier_config 的分支），所以一并列出，
+        // 而不是只报 Openai——只报一个会让 Azure 端点上的用户以为档位不生效。
+        if self.openai_params.is_some() {
+            kinds.extend([ProtocolKind::Openai, ProtocolKind::AzureOpenai, ProtocolKind::Custom]);
+        }
+        if self.anthropic_params.is_some() { kinds.push(ProtocolKind::Anthropic); }
+        if self.gemini_params.is_some() { kinds.push(ProtocolKind::Gemini); }
+        kinds
+    }
+}
+
+/// 模型原生推理参数的**类别**。
+///
+/// 存类别而不存字段名（`thinkingBudget` / `budget_tokens` / `reasoning.effort`）：字段名是
+/// 协议知识，已经由 `reasoning_adapters` 各自持有，在这里再存一份等于把适配器知识复制到
+/// serde 契约层，将来新增协议要改两处。
+///
+/// 取值只能由 `ReasoningControl` 推出，见 [`crate::reasoning_selection::native_param_kind`]。
+/// 默认 `Unknown`：探不到就是探不到，不许落到任何具体类别。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeParamKind {
+    #[default]
+    Unknown,
+    EffortEnum,
+    TokenBudget,
+    BooleanToggle,
+}
+
+/// 一条命中当前模型的自定义档位，带上"是被哪条规则怎么命中的"。
+///
+/// 命中说明必须一起返回：用户的规则表可能很长，只告诉他"这个档位适配"，他无法在表里
+/// 找出是哪一条生效，也就无从修改。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MatchedCustomTier {
+    #[serde(default)]
+    pub tier_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub rule_pattern: String,
+    #[serde(default = "default_match_type")]
+    pub rule_match_type: NameMatchType,
+    /// 该档位配了参数的协议清单。空表示这个档位在任何协议下都写不出参数。
+    #[serde(default)]
+    pub supported_protocols: Vec<ProtocolKind>,
+}
+
+/// 某个模型在某个端点下的推理档位可选面汇总，供界面一次取齐。
+///
+/// **这是只读投影，不是新的一级事实。** 每个字段都从已有数据推出：
+/// `native_param_kind` / `builtin_tiers_compatible` 来自 `ModelInfo.reasoning`，
+/// `matched_custom_tiers` 来自用户自己写的规则表。本结构的产生过程不发出站请求、
+/// 不写 `ModelInfo.reasoning`、不动 confidence。要真的重探走 `reprobe_model_reasoning`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningMeta {
+    /// 该模型在当前端点上能用推理的协议。能力未探明或探到不支持时为空。
+    #[serde(default)]
+    pub supported_protocols: Vec<ProtocolKind>,
+    #[serde(default)]
+    pub native_param_kind: NativeParamKind,
+    /// 按用户规则表顺序排列的全部适配自定义档位。无匹配是空表，不填充任何默认档。
+    #[serde(default)]
+    pub matched_custom_tiers: Vec<MatchedCustomTier>,
+    /// 内置五档能否用在这个模型上。
+    ///
+    /// 三态而非 bool：`None` 是"无法确认"，写成 `false` 会把未探明伪装成不兼容。
+    #[serde(default)]
+    pub builtin_tiers_compatible: Option<bool>,
+}
+
+/// 探测投影的时效缓存条目。
+///
+/// 只缓存能力投影那几项，**不缓存 `matched_custom_tiers`**：匹配结果随用户改规则立刻
+/// 失效，缓存它必然读到脏数据，而重算它只是一次内存遍历。
+///
+/// 同样不缓存 `supported_protocols`：它由端点协议加上"是否探明支持"推出，两者调用时都在手上。
+///
+/// 安全约束：本条目 MUST NOT 出现密钥、请求体、响应体。有单测
+/// `detection_cache_carries_no_secrets` 钉住。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningDetectionCacheEntry {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub detected_at: String,
+    #[serde(default)]
+    pub ttl_seconds: u64,
+    #[serde(default)]
+    pub native_param_kind: NativeParamKind,
+    #[serde(default)]
+    pub builtin_tiers_compatible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,6 +562,13 @@ pub struct AppSettings {
     /// 模型名匹配兜底规则，按数组顺序匹配。默认空表，程序不预置任何一条。
     #[serde(default)]
     pub reasoning_name_rules: Vec<ReasoningNameRule>,
+    /// 推理探测投影的时效缓存，按 `(归一化 base_url, model_id)` 索引。
+    ///
+    /// 这**不是**第二套能力缓存：能力本身的三档 TTL 在 `reasoning_capability.rs`，
+    /// 这里只存 `detect_model_reasoning` 那次投影的结果，过期或缺失就按当前能力表重算。
+    /// 缓存丢了不影响任何结论，只多一次内存遍历。
+    #[serde(default)]
+    pub reasoning_detection_cache: Vec<ReasoningDetectionCacheEntry>,
 }
 
 impl Default for AppSettings {
@@ -478,6 +586,7 @@ impl Default for AppSettings {
             reasoning_fallbacks: Vec::new(),
             custom_reasoning_tiers: Vec::new(),
             reasoning_name_rules: Vec::new(),
+            reasoning_detection_cache: Vec::new(),
         }
     }
 }
@@ -655,6 +764,103 @@ mod tests {
         assert_eq!(restored.reasoning_name_rules, settings.reasoning_name_rules);
         assert!(restored.custom_tier("tier-1").is_some());
         assert!(restored.custom_tier("missing").is_none());
+    }
+
+    /// 旧 state.json 没有 reasoningDetectionCache 键时加载成功，且三张用户表一条不丢。
+    ///
+    /// 这条比 `legacy_settings_without_new_tables_load_as_empty` 更严：那条验的是空表，
+    /// 这条验的是**有内容的旧文件**加载后内容完整——升级不许动用户已经调好的配置。
+    #[test]
+    fn legacy_settings_without_detection_cache_keep_every_user_table() {
+        let legacy = r#"{
+            "timeoutSeconds": 20, "proxyUrl": "", "allowSelfSignedCertificates": false,
+            "generateOnly": true, "clearClipboardSeconds": 30, "locale": "zh-CN",
+            "manualReasoningLevel": "low", "effectiveReasoningLevel": "medium",
+            "reasoningFallbacks": [{"modelId": "glm-4-plus", "tierId": "tier-1"}],
+            "customReasoningTiers": [{
+                "id": "tier-1", "label": "超深", "description": "给自建网关用",
+                "openaiParams": {"reasoning": {"effort": "xhigh"}},
+                "anthropicParams": {"thinking": {"budget_tokens": 8192}},
+                "geminiParams": null
+            }],
+            "reasoningNameRules": [{"id": "rule-1", "pattern": "glm-", "matchType": "contains", "tierId": "tier-1"}]
+        }"#;
+
+        let settings: AppSettings = serde_json::from_str(legacy).expect("旧 state.json 无法加载");
+
+        // 新字段默认为空表，不是加载失败。
+        assert!(settings.reasoning_detection_cache.is_empty());
+        // 用户的三张表一条不丢，取值也不被改写。
+        assert_eq!(settings.reasoning_fallback_for("glm-4-plus"), Some("tier-1"));
+        let tier = settings.custom_tier("tier-1").expect("自定义档位丢了");
+        assert_eq!(tier.label, "超深");
+        assert_eq!(tier.openai_params.as_ref().expect("openai 参数丢了")["reasoning"]["effort"], "xhigh");
+        assert_eq!(tier.anthropic_params.as_ref().expect("anthropic 参数丢了")["thinking"]["budget_tokens"], 8192);
+        assert!(tier.gemini_params.is_none());
+        assert_eq!(settings.reasoning_name_rules.len(), 1);
+        assert_eq!(settings.reasoning_name_rules[0].match_type, NameMatchType::Contains);
+        assert_eq!(settings.reasoning_name_rules[0].tier_id, "tier-1");
+    }
+
+    /// 探测投影结构的序列化契约：camelCase 字段名 + kebab-case 的参数类别 +
+    /// 未探明必须能表达成 null 而不是某个具体取值。
+    #[test]
+    fn detection_meta_serializes_as_camel_case_contract() {
+        let meta = ModelReasoningMeta {
+            supported_protocols: vec![ProtocolKind::Openai, ProtocolKind::AzureOpenai],
+            native_param_kind: NativeParamKind::TokenBudget,
+            matched_custom_tiers: vec![MatchedCustomTier {
+                tier_id: "tier-1".into(),
+                label: "超深".into(),
+                rule_pattern: "glm-".into(),
+                rule_match_type: NameMatchType::Prefix,
+                supported_protocols: vec![ProtocolKind::Anthropic],
+            }],
+            builtin_tiers_compatible: Some(false),
+        };
+
+        let json = serde_json::to_value(&meta).expect("序列化失败");
+        assert_eq!(json["nativeParamKind"], "token-budget");
+        assert_eq!(json["supportedProtocols"][1], "azure-openai");
+        assert_eq!(json["matchedCustomTiers"][0]["tierId"], "tier-1");
+        assert_eq!(json["matchedCustomTiers"][0]["rulePattern"], "glm-");
+        assert_eq!(json["matchedCustomTiers"][0]["ruleMatchType"], "prefix");
+        assert_eq!(json["builtinTiersCompatible"], false);
+
+        // 默认值即"什么都没探明"：类别 unknown、兼容性 null、两张表为空。
+        // null 不是 false——把未探明写成不兼容正是本次要修的病。
+        let json = serde_json::to_value(ModelReasoningMeta::default()).expect("序列化失败");
+        assert_eq!(json["nativeParamKind"], "unknown");
+        assert!(json["builtinTiersCompatible"].is_null());
+        assert_eq!(json["matchedCustomTiers"].as_array().expect("应为数组").len(), 0);
+        assert_eq!(json["supportedProtocols"].as_array().expect("应为数组").len(), 0);
+
+        // 前端传来缺字段的对象也要能反序列化（全字段 serde(default)）。
+        let sparse: ModelReasoningMeta = serde_json::from_str("{}").expect("空对象无法反序列化");
+        assert_eq!(sparse, ModelReasoningMeta::default());
+    }
+
+    /// 档位为哪些协议配了参数，只看它自己填了什么，不看模型名也不看能力表。
+    #[test]
+    fn tier_reports_only_the_protocols_it_actually_filled() {
+        let base = CustomReasoningTier {
+            id: "t".into(), label: "t".into(), description: None,
+            openai_params: None, anthropic_params: None, gemini_params: None,
+        };
+        assert!(base.supported_protocols().is_empty());
+
+        // OpenAI 参数同时覆盖 Azure 与 Custom：三者共用同一份形状。
+        let openai = CustomReasoningTier { openai_params: Some(serde_json::json!({})), ..base.clone() };
+        assert_eq!(
+            openai.supported_protocols(),
+            vec![ProtocolKind::Openai, ProtocolKind::AzureOpenai, ProtocolKind::Custom]
+        );
+
+        let anthropic = CustomReasoningTier { anthropic_params: Some(serde_json::json!({})), ..base.clone() };
+        assert_eq!(anthropic.supported_protocols(), vec![ProtocolKind::Anthropic]);
+
+        let gemini = CustomReasoningTier { gemini_params: Some(serde_json::json!({})), ..base };
+        assert_eq!(gemini.supported_protocols(), vec![ProtocolKind::Gemini]);
     }
 
     /// 三个协议参数全空的自定义档位是无效档位——它引用起来必然降级。
