@@ -35,6 +35,7 @@
 
 ## 5. 验证与发布
 
-- [ ] 5.1 `--dry-run` 验证脚本，确认不落盘。
-- [ ] 5.2 五道闸门全绿（cargo / tsc / vitest / eslint / playwright）。
-- [ ] 5.3 执行 v0.1.12 完整 Release 打包，核对产物版本号、CHANGELOG 顶部、SHA256SUMS 覆盖范围。
+- [x] 5.1 `--dry-run` 验证脚本，确认不落盘（`git status` 中四个版本文件无改动）。
+- [x] 5.2 五道闸门全绿：cargo 284、tsc 0 errors、vitest 178 / 8 文件、lint 0 warnings、playwright 66 收集 / 65 通过 / 1 既有 narrow-only skip。自增前后各跑一轮，数值一致。
+- [x] 5.3 执行 v0.1.12 完整 Release 打包：12 步全过，`旧版本：0.1.11，新版本：0.1.12` 正确输出到控制台（未乱码），两个 EXE 的 ProductVersion 与 FileVersion 均为 0.1.12，CHANGELOG.md 顶部为 0.1.12 小节且已进入 SHA256SUMS.txt 的 5 个条目。
+- [x] 5.4 CHANGELOG 的 0.1.12 正文由人工补齐（脚本只留占位，不编造）。
