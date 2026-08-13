@@ -333,6 +333,11 @@ async fn reprobe_model_reasoning(store: State<'_, StateStore>, provider_id: Stri
             }
             saved.clone()
         };
+        // 能力换了，`detect_model_reasoning` 的缓存投影就是旧的：必须在同一次 update 里作废，
+        // 否则界面在 TTL 剩余时间内继续显示重探前的参数形态。归一化规则与写缓存那侧一致。
+        let cached_base_url = protocol::normalize_base_url(&refreshed.base_url)
+            .unwrap_or_else(|_| refreshed.base_url.clone());
+        reasoning_selection::invalidate_detection_cache(&mut state.settings, &cached_base_url, &model_id);
         refresh_current_reasoning(state, false);
         Ok(refreshed)
     })?;

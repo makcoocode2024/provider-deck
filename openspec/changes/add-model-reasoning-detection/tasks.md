@@ -51,12 +51,19 @@
 
 ## 4. 模块4 · 配置预览文案同步（改 `ConfigPreview.tsx`）
 
-- [ ] 4.1 `ConfigPreview` 调用同一个 `writeTargetSummary`，展示三场景说明；不自行拼接文案
-- [ ] 4.2 `omitted` 场景不展示兜底提示，改为表明依探测结论省略档位
-- [ ] 4.3 兜底场景文案含「未探测」标注与「仅用于写入配置文件，实时请求不发送推理参数」两句
-- [ ] 4.4 vitest：同一模型同一时刻，`ConfigPreview` 与 `ReasoningTierPicker` 展示的场景与档位名一致
-- [ ] 4.5 vitest：探测失败 / 预览出错的提示文字不含 API 密钥片段
-- [ ] 4.6 闸门：五道全跑一次（cargo test --lib / tsc --noEmit / vitest run / npm run lint / npx playwright test），全部通过
+- [x] 4.1 `ConfigPreview` 调用同一个 `writeTargetSummary`，展示三场景说明；不自行拼接文案（进一步共用 `WriteTargetNote` 渲染组件，句子与标记排版一并对齐）
+- [x] 4.2 `omitted` 场景不展示兜底提示，改为表明依探测结论省略档位（复用 `originLabel("omitted")`，不新造字符串）
+- [x] 4.3 兜底场景文案含「未探测」标注与「仅用于写入配置文件，实时请求不发送推理参数」两句
+- [x] 4.4 vitest：同一模型同一时刻，`ConfigPreview` 与 `ReasoningTierPicker` 展示的场景与档位名一致（比对两处渲染文本逐字相等）
+- [x] 4.5 vitest：探测失败 / 预览出错的提示文字不含 API 密钥片段
+- [x] 4.6 闸门：五道全跑一次（cargo 284 / tsc 0 errors / vitest 154 / lint 0 warnings / playwright 65 passed + 1 既有 skip），全部通过
+
+### 4a. 附加 · 探测缓存脏窗口修复（用户指定并入本模块）
+
+- [x] 4a.1 新增 `reasoning_selection::invalidate_detection_cache(settings, base_url, model_id) -> bool`，按 `(归一化 base_url, model_id)` 精确删，不按 provider 清空
+- [x] 4a.2 `reprobe_model_reasoning` 在回写能力的同一次 `store.update` 内作废缓存，归一化规则与写缓存侧一致
+- [x] 4a.3 单测：只删目标条目，同 provider 别的模型与别的端点同名模型不受影响，无条目可删返回 `false`
+- [x] 4a.4 单测：过期条目也要真的删掉（命中判定看 TTL、作废只看键，这一不对称需被钉住）
 
 ## 5. 交付
 

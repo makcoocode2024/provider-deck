@@ -447,14 +447,104 @@ OpenSpec 变更 ID：`add-model-reasoning-detection`，规格与任务清单在
    会遮蔽刚建的档位；逐模型兜底是唯一能保证该模型确实用上新档位的表达。
 3. 预填规则被用户清空时不建规则：空 pattern 会命中一切模型，存下去比不存危险。
 
-### 10.4 下一轮：模块 4
+### 10.4 模块 4：配置预览文案同步与缓存脏窗口修复（已完成）
 
-`openspec/changes/add-model-reasoning-detection/tasks.md` 的 4.1–4.6 原样保留，下一轮直接推进：
-让 `ConfigPreview.tsx` 复用同一个 `writeTargetSummary`（禁止自行拼接文案），补两条 vitest
-（跨组件场景/档位名一致、错误文案不含密钥片段），然后五道闸门全跑一次。
+`ConfigPreview` 不再自己拼推理文案。它与 `ReasoningTierPicker` 共用**同一个渲染组件**
+`WriteTargetNote`（从 `ReasoningTierPicker.tsx` 导出），入参来自同一个 `writeTargetSummary`。
+共用组件而不是各自调函数再各自渲染，是因为后者只能保证句子相同、保不住标记与排版相同。
 
-模块 4 还挂着一项先前记录、由用户指定延后到此处统一修的缺陷：`reprobe_model_reasoning` 不清
-`reasoning_detection_cache`，重探后投影仍可能读到旧缓存，脏窗口最长等于 unknown 档的 TTL（6 小时）。
+`writeTargetSummary` 返回 `undefined` 有两种成因，预览必须区别对待：
+
+- `omitted`（探测已排除写档位）—— 显示 `originLabel("omitted")`，即「不写入档位（依探测结论省略）」。
+  不显示任何兜底提示，也不显示档位名；此时报一个档位名是错的。
+- 已探明但用户钉死了显式 binding —— 整块不出声，那由向导的「高级」区自己说明。
+
+预览是只读视图，`ReasoningWriteNote` 只读 store 里已有的 `reasoningMeta` 投影，**不触发探测**：
+打开预览不该产生任何请求。meta 缺失也不影响文案，写入场景由能力表与设置表结算。
+
+#### 缓存脏窗口修复
+
+**改动点**：新增 `reasoning_selection::invalidate_detection_cache(settings, base_url, model_id) -> bool`
+（`reasoning_selection.rs`，紧接 `upsert_detection_cache` 之后），并在
+`reprobe_model_reasoning`（`lib.rs`）回写能力的**同一次 `store.update`** 里调用它。base_url 走
+`protocol::normalize_base_url`，与写缓存那侧同一套归一化规则。
+
+**为什么必须修**：缓存存的是上一次能力结论的投影（`native_param_kind` /
+`builtin_tiers_compatible`）。重探换掉了 `ModelInfo.reasoning`，却把旧条目留着，
+`detect_model_reasoning` 会在 TTL 剩余时间里继续返回旧投影。TTL 用的是
+`reasoning_capability::TTL_UNKNOWN_SECONDS`（6 小时），所以脏窗口最长 6 小时。
+
+**复现步骤（修复前）**：
+1. 添加一个 Provider，默认模型是未探明模型（能力为 `unknown`，投影 `nativeParamKind: "unknown"`）。
+2. 打开编辑向导进到「确认模型」步 —— `detect_model_reasoning` 落一条缓存，TTL 6 小时。
+3. 点「重新探测」，且这次真的探到了能力（例如 `effortEnum`）。
+4. 档位区的参数形态说明仍是重探前的结论 —— `ParamKindNote` 不出现，或仍显示旧形态。
+   6 小时内反复重探都不变；等到 TTL 过期才会自动纠正。
+
+**作用域**：按 `(归一化 base_url, model_id)` 精确删，不按 provider 清空。同一 provider 下别的模型、
+同名模型在别的端点，缓存都原样留着 —— 连带清掉等于让那些模型白白重算一遍。
+
+**性能影响**：一次 `Vec::retain`，条目数等于用户打开过档位区的
+`(端点, 模型)` 组合数，量级是几十条，成本可忽略。它在既有的 `store.update` 事务内执行，
+不新增落盘次数。反过来说，作废后下一次 `detect_model_reasoning` 必然走重算分支，
+但那只是一次本地遍历，无出站请求。
+
+**一个刻意的不对称**（有测试钉住）：`detection_cache_hit` 过滤过期条目，
+`invalidate_detection_cache` 只看键、不看 TTL。所以作废会把过期条目也一并删掉。
+若将来有人给作废也加上 TTL 过滤，过期条目会永久留在 `state.json` 里越积越多。
+
+#### 模块 4 文件改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/components/ConfigPreview.tsx` | +40/-2：新增 `ReasoningWriteNote`，复用 `WriteTargetNote` 与 `writeTargetSummary`；`omitted` 走 `originLabel` |
+| `src/components/ReasoningTierPicker.tsx` | 1 行：`WriteTargetNote` 由私有改为 `export` |
+| `src-tauri/src/reasoning_selection.rs` | +21 实现 / +40 测试：`invalidate_detection_cache` 与两条单测 |
+| `src-tauri/src/lib.rs` | +5：`reprobe_model_reasoning` 在回写能力的同一次 update 里作废缓存 |
+| `src/components/ConfigPreview.test.tsx` | 新增：5 例（见下） |
+| `src/styles.css` | +2：`.preview-reasoning-note` |
+| `.gitignore` | +7：本地工具链永久过滤项 |
+
+#### 模块 4 新增测试用例
+
+Rust（2 例，`reasoning_selection.rs`）：
+
+| 用例 | 场景 |
+| --- | --- |
+| `invalidate_detection_cache_removes_only_the_target_entry` | 只删目标键；同 provider 别的模型、别的端点同名模型都留着；无条目可删时返回 `false` 且不 panic |
+| `invalidate_detection_cache_also_drops_expired_entries` | 过期条目虽不命中但仍在数组里，作废要真的删掉，防止 `state.json` 里堆积 |
+
+vitest（5 例，`ConfigPreview.test.tsx`）：
+
+| 用例 | 场景 |
+| --- | --- |
+| 兜底场景带「未探测」标注与配置文件专属说明 | 4.3：两句话都在 |
+| `omitted` 场景不显示兜底提示，改为说明依探测结论省略 | 4.2：正向断言「不写入档位（依探测结论省略）」，反向断言「配置写入」「全局回退档」整句缺席 |
+| 没有默认模型时整块说明缺席，diff 仍照常渲染 | 边界：不因缺模型而崩，也不空渲染一行 |
+| 与 `ReasoningTierPicker` 展示同一个场景与同一个档位名 | 4.4：比对两个组件**渲染出的文本**逐字相等，不是各自再调一次函数——后者只能证明函数是纯的 |
+| 预览文案不含任何密钥或鉴权字段片段 | 4.5：扫全 DOM 文本，禁 `sk-` / `AIza` / `apiKey` / `api_key` / `Authorization` / `Bearer`；同时正向断言兜底说明确已渲染，避免"什么都没渲染"导致否定断言空转通过 |
+
+新增用例全部不含明文密钥与鉴权字段，错误文案取「写入失败：目标文件被占用（已回滚）」这类脱敏措辞。
+
+#### 模块 4 闸门结果
+
+2026-08-13 五道全跑：
+
+| 命令 | 模块 3 后 | 模块 4 后 | 结果 |
+| --- | --- | --- | --- |
+| `cargo test --lib --manifest-path src-tauri/Cargo.toml` | 282 | 284 | 全绿 |
+| `node_modules/.bin/tsc --noEmit -p tsconfig.app.json` | — | — | 0 errors |
+| `npm run test`（vitest） | 149 | 154 | 全绿 / 7 files |
+| `npm run lint` | — | — | 0 warnings |
+| `npx playwright test` | 66 | 66 | 65 passed, 1 skipped（既有 narrow-only skip） |
+
+模块 4 未新增 E2E：文案一致性由 4.4 的跨组件断言覆盖，且该断言比 E2E 更强——
+它逐字比对两个组件的渲染文本，E2E 只能分别断言各自出现了某段文字。
+
+### 10.9 下一轮：本次变更已可归档
+
+模块 1–4 全部完成，`openspec/changes/add-model-reasoning-detection/tasks.md` 全项勾选。
+下一轮可走 `openspec-archive-change`，把三份 spec 合入 `openspec/specs/`。归档前无未决项。
 
 ### 10.5 文件修改记录
 

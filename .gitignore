@@ -19,3 +19,10 @@ artifacts/
 release/
 build-output/
 发布包/
+
+# 本地 AI 工具链与临时副本。只对本机这一份工作树有意义，不入版本库。
+.agents/
+.claude/
+PROJECT_CONTEXT.md
+RELEASE_GUIDE.md
+build_all - 副本.bat

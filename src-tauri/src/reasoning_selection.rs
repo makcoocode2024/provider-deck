@@ -451,6 +451,27 @@ pub fn upsert_detection_cache(
     }
 }
 
+/// 作废某个 `(base_url, model_id)` 的探测缓存，返回是否真的删掉了条目。
+///
+/// 重新发现能力之后必须调它。缓存里存的是**上一次**能力结论的投影
+/// （`native_param_kind` / `builtin_tiers_compatible`），重探换掉了
+/// `ModelInfo.reasoning` 却留着旧条目的话，`detect_model_reasoning` 会在 TTL 剩余时间里
+/// 继续返回旧投影——用户点了"重新探测"，界面上的参数形态却不动，最长可达 unknown 档的 TTL。
+///
+/// 按 `(base_url, model_id)` 精确删，不按 provider 清空：同一个 provider 下别的模型的
+/// 缓存仍然有效，连带清掉等于让那些模型白白重算一遍。
+pub fn invalidate_detection_cache(
+    settings: &mut crate::model::AppSettings,
+    base_url: &str,
+    model_id: &str,
+) -> bool {
+    let before = settings.reasoning_detection_cache.len();
+    settings
+        .reasoning_detection_cache
+        .retain(|entry| !(entry.base_url == base_url && entry.model_id == model_id));
+    settings.reasoning_detection_cache.len() != before
+}
+
 /// 配置写出时兜底档位的来源，用于预览里说清这个参数是哪一级给的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackOrigin {
@@ -1143,6 +1164,45 @@ mod fallback_tests {
         assert_eq!(settings.reasoning_detection_cache.len(), 1);
         upsert_detection_cache(&mut settings, cache_entry("https://b.example.com/v1", "m", fresh));
         assert_eq!(settings.reasoning_detection_cache.len(), 2);
+    }
+
+    /// 作废只删目标那一条，同 provider 下别的模型、别的端点原样留着。
+    #[test]
+    fn invalidate_detection_cache_removes_only_the_target_entry() {
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mut settings = AppSettings::default();
+        upsert_detection_cache(&mut settings, cache_entry("https://a.example.com/v1", "m", fresh.clone()));
+        upsert_detection_cache(&mut settings, cache_entry("https://a.example.com/v1", "other", fresh.clone()));
+        upsert_detection_cache(&mut settings, cache_entry("https://b.example.com/v1", "m", fresh));
+
+        assert!(invalidate_detection_cache(&mut settings, "https://a.example.com/v1", "m"));
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "m").is_none());
+        // 同 provider 下的另一个模型不受影响：连带清掉等于让它白白重算。
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "other").is_some());
+        // 另一个端点的同名模型是另一条事实，同样不动。
+        assert!(detection_cache_hit(&settings, "https://b.example.com/v1", "m").is_some());
+        assert_eq!(settings.reasoning_detection_cache.len(), 2);
+
+        // 没有条目可删时返回 false，且不 panic —— 首次重探就走这条路径。
+        assert!(!invalidate_detection_cache(&mut settings, "https://a.example.com/v1", "m"));
+        assert_eq!(settings.reasoning_detection_cache.len(), 2);
+    }
+
+    /// 作废会清掉过期条目：命中判定过滤过期，但条目本身还在数组里。
+    ///
+    /// 钉住这一点是因为 `detection_cache_hit` 与 `invalidate_detection_cache` 用的是两套判定
+    /// （前者看 TTL，后者只看键）。若将来有人给作废也加上 TTL 过滤，过期条目会永久留在
+    /// `state.json` 里越积越多。
+    #[test]
+    fn invalidate_detection_cache_also_drops_expired_entries() {
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(crate::reasoning_capability::TTL_UNKNOWN_SECONDS as i64 + 1))
+            .to_rfc3339();
+        let mut settings = AppSettings::default();
+        upsert_detection_cache(&mut settings, cache_entry("https://a.example.com/v1", "m", stale));
+
+        assert!(detection_cache_hit(&settings, "https://a.example.com/v1", "m").is_none(), "过期条目不该命中");
+        assert!(invalidate_detection_cache(&mut settings, "https://a.example.com/v1", "m"));
+        assert!(settings.reasoning_detection_cache.is_empty());
     }
 
     /// 缓存条目里不许出现任何密钥片段。

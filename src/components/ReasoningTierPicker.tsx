@@ -402,7 +402,7 @@ function TierGroups({ groups, state, selection, detecting, onCreateTier }: {
  * 自己填的档位得到了服务端确认。文案整句来自 {@link writeTargetSummary}，
  * 与 `ConfigPreview` 逐字相同——这是"两处措辞一致"唯一可验证的实现方式。
  */
-function WriteTargetNote({ writeTarget }: { writeTarget?: WriteTargetSummary }) {
+export function WriteTargetNote({ writeTarget }: { writeTarget?: WriteTargetSummary }) {
   if (!writeTarget) return null;
   return (
     <p className="reasoning-fallback-note">

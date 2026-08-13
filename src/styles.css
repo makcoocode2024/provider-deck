@@ -250,6 +250,8 @@ input:hover, select:hover { border-color: #aebbb5; }
 .change-block .after { color: #86d7b3; }
 .warning { display: flex; gap: 6px; color: var(--amber); font-size: 11px; margin-bottom: 0; }
 .preview-dialog > .security-note, .preview-dialog > .dialog-actions { margin-left: 22px; margin-right: 22px; }
+/* 预览顶部的推理档位说明。贴着 diff 列表上沿，先说清"会写哪一档"再让用户读 diff。 */
+.preview-reasoning-note { padding: 13px 22px 0; }
 .preview-dialog > .dialog-actions { margin-bottom: 20px; }
 .test-dialog { width: min(620px, calc(100vw - 28px)); }
 .test-dialog > .dialog-actions { margin: 0 22px 20px; }
