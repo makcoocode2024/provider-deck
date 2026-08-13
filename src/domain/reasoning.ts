@@ -10,9 +10,13 @@
  */
 
 import type {
+  CustomReasoningTier,
   ReasoningBinding,
   ReasoningCapability,
   ReasoningConfidence,
+  ReasoningFallback,
+  ReasoningLevel,
+  ReasoningNameRule,
   ReasoningSelection,
   ReasoningTier,
   ReasoningTierOption,
@@ -171,6 +175,245 @@ export function stateMessage(state: ReasoningUiState): string | undefined {
 /** 约束说明，直接来自后端；前端不添加解释。 */
 export function constraintNotes(capability?: ReasoningCapability | null): string[] {
   return capability?.constraints.notes ?? [];
+}
+
+// —— 兜底档位的投影。
+//
+// 与上面的能力投影严格分开：能力是探测到的事实，兜底是用户在"还没探明"时给出的
+// 权宜设定。两者在 UI 上必须一眼能分辨，所以这一段刻意不复用 confidenceLabels——
+// 给一个用户自己填的值套上"服务端声明"之类的措辞，就是把设定伪装成事实。
+//
+// 这一段也不参与请求参数结算：兜底只影响配置文件写出（后端 config::codex_reasoning），
+// 实时请求对未探明能力仍然省略推理参数，否则会给网关发它不认的取值。
+
+/**
+ * 内置档位的展示名，镜像后端 `ReasoningTier::label()`。
+ *
+ * 这里出现档位字面量是可以的：内置档位是一个封闭枚举，不随服务端声明增减。
+ * 会随服务端变化的那份清单一律来自 `capability.tiers`，不在这里。
+ */
+const builtinTierLabels: Record<ReasoningTier, string> = {
+  off: "关闭",
+  light: "轻度",
+  standard: "中度",
+  deep: "高",
+  max: "最大",
+};
+
+/** 内置档位清单，供兜底与规则的档位下拉使用（「内置档位」分组）。 */
+export const builtinReasoningTiers: readonly { id: ReasoningTier; label: string }[] = (
+  ["off", "light", "standard", "deep", "max"] as const
+).map((id) => ({ id, label: builtinTierLabels[id] }));
+
+/**
+ * 把一个档位 id 解析成展示名，并说明它是内置的还是用户自建的。
+ *
+ * 与后端 `resolve_tier_config` 同样的查找顺序：先内置，再自定义。找不到返回
+ * `undefined`——那不是错误，是"引用的档位已被删除"，调用方据此降级。
+ */
+export function resolveTierLabel(
+  tierId: string | undefined,
+  customTiers: CustomReasoningTier[] | undefined,
+): { label: string; custom: boolean } | undefined {
+  if (!tierId) return undefined;
+  const builtin = builtinTierLabels[tierId as ReasoningTier];
+  if (builtin) return { label: builtin, custom: false };
+  const custom = (customTiers ?? []).find((tier) => tier.id === tierId);
+  if (!custom) return undefined;
+  return { label: custom.label.trim() || custom.id, custom: true };
+}
+
+/** 某个模型的兜底档位 id。全等匹配 modelId，与后端 `reasoning_fallback_for` 同规则。 */
+export function fallbackFor(
+  fallbacks: ReasoningFallback[] | undefined,
+  modelId: string | undefined,
+): string | undefined {
+  if (!fallbacks || !modelId) return undefined;
+  return fallbacks.find((item) => item.modelId === modelId)?.tierId;
+}
+
+/**
+ * 首个命中的模型名规则，镜像后端 `match_name_fallback`：
+ * 数组顺序即优先级，大小写不敏感，空 pattern 不参与匹配。
+ *
+ * 这不是"按模型名推断能力"：规则表初始为空，每一条都是用户自己写下的，
+ * 而且只影响配置文件写出。
+ */
+export function matchNameRule(
+  rules: ReasoningNameRule[] | undefined,
+  modelId: string | undefined,
+): ReasoningNameRule | undefined {
+  if (!rules || !modelId) return undefined;
+  const target = modelId.toLowerCase();
+  return rules.find((rule) => {
+    const pattern = rule.pattern.trim().toLowerCase();
+    if (!pattern) return false;
+    return rule.matchType === "contains" ? target.includes(pattern) : target.startsWith(pattern);
+  });
+}
+
+/** 覆盖式写入，同一模型只留一条。空 modelId 视为无效输入，原样返回。 */
+export function upsertFallback(
+  fallbacks: ReasoningFallback[] | undefined,
+  incoming: ReasoningFallback,
+): ReasoningFallback[] {
+  const modelId = incoming.modelId.trim();
+  if (!modelId) return fallbacks ?? [];
+  const rest = (fallbacks ?? []).filter((item) => item.modelId !== modelId);
+  return [...rest, { modelId, tierId: incoming.tierId }];
+}
+
+export function removeFallback(
+  fallbacks: ReasoningFallback[] | undefined,
+  modelId: string,
+): ReasoningFallback[] {
+  return (fallbacks ?? []).filter((item) => item.modelId !== modelId);
+}
+
+/**
+ * 配置写出时这个模型实际会用哪个档位，以及那个档位的来源。
+ *
+ * 五种来源与后端 `config::codex_reasoning` 的分支一一对应，兜底三级按优先级排列：
+ * - `discovered`：能力已探明为 supported 且有可用档位，档位来自探测结果与用户选择，
+ *   兜底完全不参与
+ * - `model-fallback`：能力缺失或 Unknown，用户为这个模型单独设了兜底
+ * - `name-rule`：能力缺失或 Unknown，没有逐模型设定，但命中了用户写的模型名规则
+ * - `global-fallback`：能力缺失或 Unknown，以上都没有，走全局回退档
+ * - `omitted`：探测已经给出结论，而结论排除了写档位——`unsupported`（探到不支持），
+ *   或 `empty`（声明支持却没有任何可用档位）。这两种情况后端都不调用兜底闭包，
+ *   用户设定推翻不了探测到的事实
+ *
+ * 单模型兜底压过名称规则：前者点名了这一个模型，后者是一条泛化规则，
+ * 具体的意图应当胜过宽泛的意图。
+ *
+ * `discovered` 只回答"档位来自事实"，不回答"这个档位能否写进 Codex 的
+ * model_reasoning_effort"——那要重算一遍 Adapter 的协议映射，是后端的职责，
+ * 前端复算等于把同一件事实现两遍。
+ */
+export type ReasoningOrigin =
+  | "discovered"
+  | "model-fallback"
+  | "name-rule"
+  | "global-fallback"
+  | "omitted";
+
+/** 兜底结算需要读的三张用户配置表。故意只收这几个字段，避免调用方传整个 AppSettings。 */
+export interface FallbackSettings {
+  effectiveReasoningLevel: ReasoningLevel;
+  reasoningFallbacks?: ReasoningFallback[];
+  customReasoningTiers?: CustomReasoningTier[];
+  reasoningNameRules?: ReasoningNameRule[];
+}
+
+export function reasoningOrigin(
+  capability: ReasoningCapability | null | undefined,
+  settings: FallbackSettings | undefined,
+  modelId: string | undefined,
+): ReasoningOrigin {
+  const state = reasoningUiState(capability);
+  if (state === "supported") return "discovered";
+  if (state === "unsupported" || state === "empty") return "omitted";
+  if (!settings) return "global-fallback";
+  // 逐级降级：档位引用不到就当这一级不存在，继续往下找。与后端同一套规则。
+  const custom = settings.customReasoningTiers;
+  if (resolveTierLabel(fallbackFor(settings.reasoningFallbacks, modelId), custom)) return "model-fallback";
+  const rule = matchNameRule(settings.reasoningNameRules, modelId);
+  if (rule && resolveTierLabel(rule.tierId, custom)) return "name-rule";
+  return "global-fallback";
+}
+
+/**
+ * 来源标签。刻意与 confidenceLabels 用词不重叠：那一组描述"证据有多硬"，
+ * 这一组描述"这个值是探来的还是用户填的"。
+ *
+ * `omitted` 的措辞不说明具体原因（不支持 / 无可用档位），因为 `stateMessage()`
+ * 已经在同一处界面把原因说清了，这里再说一遍就会出现两句解释同一件事。
+ */
+const originLabels: Record<ReasoningOrigin, string> = {
+  discovered: "已探明档位",
+  "model-fallback": "兜底档位（用户为该模型设定，未探测）",
+  "name-rule": "兜底档位（命中用户设定的模型名规则，未探测）",
+  "global-fallback": "兜底档位（全局回退档，未探测）",
+  omitted: "不写入档位（依探测结论省略）",
+};
+
+export function originLabel(origin: ReasoningOrigin): string {
+  return originLabels[origin];
+}
+
+/** 该来源是否属于兜底。UI 用它决定要不要打"非探测结论"的标记。 */
+export function isFallbackOrigin(origin: ReasoningOrigin): boolean {
+  return origin === "model-fallback" || origin === "name-rule" || origin === "global-fallback";
+}
+
+/**
+ * 配置写出时这个模型实际会用的档位，展示成一个名字。
+ *
+ * 只在兜底场景返回取值——已探明时档位来自 `capability.tiers` 与用户选择，
+ * 由 activeOption 负责，这里不重复结算，避免两处各算一遍算出不同答案。
+ *
+ * 全局回退档返回旧枚举的原始取值（low/medium/high）：后端没有为那个旧枚举提供
+ * 展示 label，前端就不发明一个，与设置页的下拉保持一致。
+ */
+export function effectiveFallbackTier(
+  capability: ReasoningCapability | null | undefined,
+  settings: FallbackSettings,
+  modelId: string | undefined,
+): { label: string; custom: boolean } | undefined {
+  const origin = reasoningOrigin(capability, settings, modelId);
+  const custom = settings.customReasoningTiers;
+  if (origin === "model-fallback") {
+    return resolveTierLabel(fallbackFor(settings.reasoningFallbacks, modelId), custom);
+  }
+  if (origin === "name-rule") {
+    return resolveTierLabel(matchNameRule(settings.reasoningNameRules, modelId)?.tierId, custom);
+  }
+  if (origin === "global-fallback") return { label: settings.effectiveReasoningLevel, custom: false };
+  return undefined;
+}
+
+/**
+ * 兜底提示的完整内容，一次算好交给组件渲染。
+ *
+ * 做成一个对象而不是让组件分别调 `reasoningOrigin` + `effectiveFallbackTier`：
+ * 那样两个展示位置各算一遍，将来任一处漏改就会出现"一处说兜底、一处说已探明"。
+ * `undefined` 表示当前不该出现兜底提示（已探明，或探测结论已排除写档位）。
+ *
+ * `message` 是给用户看的一句话。措辞全部是设定性的（"兜底""仅配置生效"），
+ * 不含"支持""兼容""已确认"——那些词属于探测结论。
+ */
+export interface ReasoningFallbackNotice {
+  origin: Extract<ReasoningOrigin, "model-fallback" | "name-rule" | "global-fallback">;
+  /** 档位展示名。自定义档位为用户填的名字，全局回退档为旧枚举取值。 */
+  tier: string;
+  /** 该档位是否是用户自建的，UI 用它决定要不要打「自定义」标记。 */
+  custom: boolean;
+  label: string;
+  message: string;
+}
+
+export function fallbackNotice(
+  capability: ReasoningCapability | null | undefined,
+  settings: FallbackSettings | undefined,
+  modelId: string | undefined,
+): ReasoningFallbackNotice | undefined {
+  if (!settings) return undefined;
+  const origin = reasoningOrigin(capability, settings, modelId);
+  if (origin === "discovered" || origin === "omitted") return undefined;
+  const resolved = effectiveFallbackTier(capability, settings, modelId);
+  if (!resolved) return undefined;
+  const messages: Record<typeof origin, string> = {
+    "model-fallback": `单模型兜底档位：${resolved.label}（仅配置生效）`,
+    "name-rule": `名称规则兜底：${resolved.label}（仅配置生效）`,
+    "global-fallback": `全局回退档：${resolved.label}（仅配置生效）`,
+  };
+  return {
+    origin,
+    tier: resolved.label,
+    custom: resolved.custom,
+    label: originLabel(origin),
+    message: messages[origin],
+  };
 }
 
 // —— 运行时验证的投影。

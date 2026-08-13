@@ -4,6 +4,7 @@ mod clients;
 mod config;
 mod credentials;
 mod error;
+mod launcher;
 mod model;
 mod local_proxy;
 mod responses_chat;
@@ -446,6 +447,66 @@ async fn verify_model_reasoning(
 #[tauri::command]
 fn detect_clients() -> Vec<ClientDescriptor> { clients::detect_all() }
 
+/// 给"不需要 Provider 的启动"凑签名用的空壳。
+///
+/// 只有 `env_injection` 为 false 的客户端会走到这里，`env_plan` 对它们一律返回空计划，
+/// 所以这里的字段值都到不了子进程。base_url 留空而不是编一个像样的地址：
+/// 万一将来有人让它流到别处，空串会立刻暴露，一个假地址不会。
+fn placeholder_provider() -> Provider {
+    Provider {
+        id: String::new(), name: String::new(), base_url: String::new(),
+        protocol: model::ProtocolKind::Custom, enabled: false, is_current: false,
+        default_model: None, claude_model_profile: None, claude_extended_context: false,
+        claude_model_mappings: Default::default(),
+        codex_compatibility: model::CodexCompatibility::NotApplicable,
+        codex_probe_model: None, codex_probe_detail: None,
+        reasoning_selections: Vec::new(), reasoning_verifications: Default::default(),
+        models: Vec::new(), connection_state: "unknown".into(), confidence: None,
+        last_checked_at: None, applied_clients: Vec::new(), error_summary: None,
+    }
+}
+
+/// 启动客户端，对确认会读环境变量的客户端顺带注入密钥。
+///
+/// 密钥在这里现取现用：只进子进程的环境块，不落盘、不进 state.json、不进返回值。
+/// base_url 的取法与 `preview_changes` 一致——ChatProxy 模式下要给本地桥的地址，
+/// 否则客户端会绕过桥直连上游，而上游正是那个不支持 Responses 协议的网关。
+#[tauri::command]
+fn launch_client(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, client_id: String, provider_id: Option<String>) -> AppResult<launcher::LaunchOutcome> {
+    let client = launcher::descriptor_for(&client_id)?;
+    let state = store.read();
+
+    // 客户端没装就别往下走：后面读凭据是有代价的动作（弹系统钥匙串授权），
+    // 为一个注定失败的启动去读密钥不值得。
+    if client.launch_target.is_none() {
+        return Err(AppError::InvalidInput(format!("未检测到 {} 的可执行文件，请先安装该客户端", client.name)));
+    }
+
+    // 没指定 Provider（或该客户端不注入）时纯启动。空密钥不会被用到：
+    // env_plan 对 env_injection 为 false 的客户端一律返回空计划。
+    let Some(provider_id) = provider_id.filter(|_| client.env_injection) else {
+        // 不注入的客户端（桌面端就是）压根不需要 Provider。用第一个 Provider 只是
+        // 为了凑 launch 的签名；一个都没有时也要能拉起——桌面端本来就不碰 API 配置，
+        // 因为"还没配服务"就拒绝启动 Claude Desktop 是没道理的。
+        let provider = state.providers.first().cloned().unwrap_or_else(placeholder_provider);
+        let base_url = provider.base_url.clone();
+        return launcher::launch(&client, &provider, &base_url, "");
+    };
+
+    let provider = state.providers.iter().find(|item| item.id == provider_id).cloned()
+        .ok_or_else(|| AppError::InvalidInput(format!("未找到该服务（{provider_id}），无法启动客户端")))?;
+    // 凭据缺失要给出可操作的话术：用户需要知道去哪儿补，而不是只看到一句"读取失败"。
+    let secret = credentials::get(&provider_id).map_err(|error| {
+        AppError::InvalidInput(format!("未找到 {} 的 API 密钥（{error}）。请在服务编辑页重新填写并保存。", provider.name))
+    })?;
+    let base_url = if matches!(provider.codex_compatibility, model::CodexCompatibility::ChatProxy) {
+        proxy.provider_base_url(&provider.id)
+    } else {
+        provider.base_url.clone()
+    };
+    launcher::launch(&client, &provider, &base_url, &secret)
+}
+
 #[tauri::command]
 fn preview_changes(store: State<'_, StateStore>, proxy: State<'_, LocalProxy>, provider_id: String, client_ids: Vec<String>) -> AppResult<Vec<ConfigChange>> {
     let state = store.read();
@@ -624,7 +685,7 @@ pub fn run() {
         }
     })
     .manage(store).manage(proxy).manage(chats).invoke_handler(tauri::generate_handler![
-        list_providers, get_provider_api_key, save_provider, delete_provider, set_current_provider, probe_provider, reprobe_provider, detect_clients,
+        list_providers, get_provider_api_key, save_provider, delete_provider, set_current_provider, probe_provider, reprobe_provider, detect_clients, launch_client,
         refresh_provider_models, reprobe_model_reasoning, verify_model_reasoning, test_provider,
         preview_changes, apply_changes, list_backups, restore_backup, get_settings, save_settings,
         list_chat_backups, chat_cache_summary, export_chat_backup, restore_chat_backup_file, restore_chat_backup_payload, restore_chat_cache, rollback_chat_restore,
@@ -657,6 +718,25 @@ mod tests {
             &["low".into(), "high".into()],
             ReasoningConfidence::Declared,
         )
+    }
+
+    /// 占位 Provider 不能带任何能流到子进程的内容。
+    ///
+    /// 它只在"不注入的客户端 + 用户还没配服务"这条路径上出现。今天 env_plan 对
+    /// 这些客户端返回空计划，所以字段值到不了子进程；这个测试钉住的是**将来**
+    /// 有人改了 env_plan 时，占位值本身也是无害的。
+    #[test]
+    fn placeholder_provider_carries_nothing_injectable() {
+        let placeholder = placeholder_provider();
+        assert!(placeholder.base_url.is_empty(), "占位 Provider 不得带 base_url");
+        assert!(placeholder.id.is_empty());
+        assert!(placeholder.default_model.is_none());
+        assert!(!placeholder.enabled, "占位 Provider 不得是启用状态");
+        // 空计划是前提：任何客户端配上这个占位 Provider 都不该产出注入项。
+        for id in ["claude-desktop", "chatgpt-desktop", "codex-cli", "claude-code"] {
+            let client = launcher::descriptor_for(id).expect("客户端未注册");
+            assert!(launcher::env_plan(&client, &placeholder, "", "").is_empty(), "{id} 对占位 Provider 产出了注入项");
+        }
     }
 
     /// 要求 5：刷新 / 重新检测模型不能丢掉已发现的推理能力。

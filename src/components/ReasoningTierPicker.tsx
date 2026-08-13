@@ -7,6 +7,7 @@ import type {
   ReasoningTier,
   RuntimeVerification,
 } from "../domain/types";
+import type { ReasoningFallbackNotice } from "../domain/reasoning";
 import {
   activeTier,
   advancedOptions,
@@ -38,6 +39,13 @@ interface Props {
   /** 发起一次真实验证请求。`undefined` 表示当前上下文不允许验证（例如新建流程还没有 provider）。 */
   onVerify?(tier: ReasoningTier): void;
   verifying?: boolean;
+  /**
+   * 未探明能力时配置写出会用的兜底档位，由 {@link fallbackNotice} 算好后传入。
+   *
+   * 这是**用户设定**，与 `capability` 的任何字段无关，所以单独一个入参、单独的样式类，
+   * 也绝不经过 `confidenceLabel`。`undefined` 表示不该显示兜底提示。
+   */
+  fallback?: ReasoningFallbackNotice;
 }
 
 /**
@@ -48,7 +56,7 @@ interface Props {
  * 所以服务端新增成员时无需改动这里。
  */
 export function ReasoningTierPicker({
-  capability, selection, onChange, onReprobe, reprobing, verifications, onVerify, verifying,
+  capability, selection, onChange, onReprobe, reprobing, verifications, onVerify, verifying, fallback,
 }: Props) {
   const state = reasoningUiState(capability);
   const message = stateMessage(state);
@@ -67,6 +75,7 @@ export function ReasoningTierPicker({
           {state === "unsupported" ? <Info size={18} /> : <AlertTriangle size={18} />}
           <span>{message}</span>
         </div>
+        <FallbackNotice fallback={fallback} />
         {state !== "unsupported" && onReprobe && (
           <button className="button" type="button" onClick={onReprobe} disabled={reprobing}>
             {reprobing ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}重新探测
@@ -294,6 +303,23 @@ function BooleanToggle({ options, current, capability, onChange }: {
         <Switch.Thumb className="switch-thumb" />
       </Switch.Root>
     </div>
+  );
+}
+
+/**
+ * 兜底档位提示。
+ *
+ * 措辞刻意与 confidence 徽章不同源：这里说的是"没探到，所以按你设的值写"，
+ * 而 confidence 说的是"探到的证据有多硬"。把两者写成一句话就会让用户以为
+ * 自己填的档位得到了服务端确认。
+ */
+function FallbackNotice({ fallback }: { fallback?: ReasoningFallbackNotice }) {
+  if (!fallback) return null;
+  return (
+    <p className="reasoning-fallback-note">
+      <span className="reasoning-badge fallback">{fallback.tier}{fallback.custom && <em> · 自定义</em>}</span>
+      <small>{fallback.message} · 仅用于写入配置文件，实时请求仍不发送推理参数。探测成功后自动改用已探明档位。</small>
+    </p>
   );
 }
 

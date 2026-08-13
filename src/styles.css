@@ -97,7 +97,7 @@ small { color: var(--muted); }
 .status-icon.error { color: var(--red); background: #f9e5e5; }
 
 .client-table { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: white; }
-.table-head, .table-row { display: grid; grid-template-columns: 50px minmax(220px, 1.5fr) 110px 120px 100px; align-items: center; gap: 10px; padding: 0 14px; }
+.table-head, .table-row { display: grid; grid-template-columns: 50px minmax(200px, 1.4fr) 100px 150px 92px 96px; align-items: center; gap: 10px; padding: 0 14px; }
 .table-head { min-height: 38px; background: #f2f5f3; color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
 .table-row { min-height: 64px; border-top: 1px solid #e4e8e6; font-size: 12px; }
 .table-row > span:nth-child(2) { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
@@ -109,6 +109,14 @@ small { color: var(--muted); }
 .muted { color: var(--muted); }
 .empty-band, .security-note { display: flex; gap: 9px; align-items: flex-start; color: #3a5e4d; background: #eaf3ee; border: 1px solid #d3e6dc; border-radius: 6px; padding: 11px 13px; font-size: 12px; margin-bottom: 18px; }
 .security-note.compat-warning { color: #755019; background: #fff7e8; border-color: #ead4a5; }
+/* 启动结果。注入提醒可能有三四条，逐行排开而不是挤成一段。 */
+.launch-outcome > span { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.launch-outcome small { font-size: 11px; line-height: 1.5; color: #4a6a5b; }
+.launch-outcome .button.ghost { align-self: flex-start; padding: 4px; }
+
+/* 客户端行内的引导文案。与上一行的探测路径拉开距离，免得两段小字读成一句。
+   手动级别的客户端靠这段文字说明"为什么这里没有写入按钮"，所以不能压得太小。 */
+.client-table .client-guidance { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; white-space: normal; }
 
 /* 运行时验证区。与上方的能力信息之间用一条分隔线断开，避免读成同一组结论：
    header 里的 confidence 是系统探测，这里的徽章是用户验证。 */
@@ -128,6 +136,39 @@ small { color: var(--muted); }
 .verification-badge.confirmed { color: #176344; background: #e2f2ea; }
 .verification-badge.rejected { color: #8a5a0a; background: #fff1d8; }
 .verification-badge.failed { color: var(--red); background: #f9e5e5; }
+
+/* 兜底档位。配色刻意用中性灰蓝，既不是 confirmed 的绿（那读成"已确认"），
+   也不是 failed 的红（它不是错误）——它只是一个尚未被证实的用户设定。 */
+.reasoning-badge.fallback { display: inline-flex; align-items: center; width: fit-content; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; color: #46545f; background: #eceff1; border: 1px dashed #b6c0c6; }
+.reasoning-fallback-note { display: flex; align-items: baseline; gap: 8px; margin: 0; }
+.reasoning-fallback-note small { color: var(--muted); }
+.fallback-note { color: var(--muted); }
+.fallback-editor { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.fallback-editor h3 { margin: 0 0 4px; font-size: 13px; }
+.fallback-add { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.fallback-add input { flex: 1; min-width: 0; }
+.fallback-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.fallback-list li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: #f6f8f7; border: 1px solid var(--border); border-radius: 6px; }
+.fallback-list li code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+ol.fallback-list { counter-reset: rule; }
+ol.fallback-list li::before { counter-increment: rule; content: counter(rule); flex: none; width: 17px; height: 17px; display: grid; place-items: center; color: var(--muted); background: white; border: 1px solid var(--border); border-radius: 50%; font-size: 10px; }
+.empty-hint { margin: 0; font-size: 12px; color: var(--muted); }
+/* 兜底配置区的补充说明。刻意比正文更弱：它说明的是作用范围，不是操作步骤。 */
+.section-note, .scope-note { margin: 0 0 10px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.scope-note { margin: 10px 0 0; padding-top: 8px; border-top: 1px dashed var(--border); }
+/* 引用不到的档位。用红色而不是静默替换成别的档位：规则坏了要看得见。 */
+.reasoning-badge.fallback.missing { color: var(--red); background: #fdf0ee; border-color: #e8b4ac; }
+.protocol-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.tier-dialog { padding: 22px; }
+.tier-dialog.narrow { width: min(460px, calc(100vw - 28px)); }
+.tier-dialog h2 { margin: 0 0 14px; font-size: 16px; }
+.json-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; color: #37423d; font-size: 12px; font-weight: 600; }
+.json-field textarea { width: 100%; border: 1px solid #c8d0cc; border-radius: 5px; color: #202925; background: white; padding: 8px 10px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.5; resize: vertical; }
+.json-field textarea:hover { border-color: #aebbb5; }
+.warning-message { display: flex; align-items: flex-start; gap: 9px; margin: 0; padding: 11px 12px; color: #7a4210; background: #fdf6ec; border: 1px solid #f0dcc0; border-radius: 6px; font-size: 12px; line-height: 1.6; }
+.warning-message svg { flex: none; margin-top: 1px; color: var(--amber); }
+.button.danger { color: white; background: var(--red); border-color: var(--red); }
+.button.danger:hover { filter: brightness(.93); }
 
 .dialog-overlay { position: fixed; inset: 0; z-index: 50; background: rgba(15, 20, 18, .48); animation: fade-in .15s ease; }
 .dialog { position: fixed; z-index: 51; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(680px, calc(100vw - 28px)); max-height: calc(100vh - 30px); overflow: auto; background: white; border: 1px solid #cfd7d3; border-radius: 8px; box-shadow: 0 24px 70px rgba(0,0,0,.22); }
@@ -282,9 +323,10 @@ input:hover, select:hover { border-color: #aebbb5; }
   .test-summary { align-items: flex-start; flex-direction: column; gap: 4px; }
   .client-table { border-left: 0; border-right: 0; border-radius: 0; }
   .table-head { display: none; }
-  .table-row { grid-template-columns: 36px 1fr auto; padding: 10px 8px; }
-  .table-row > span:nth-child(5) { display: none; }
+  .table-row { grid-template-columns: 36px 1fr auto auto; padding: 10px 8px; }
+  .table-row > span:nth-child(3), .table-row > span:nth-child(5) { display: none; }
   .table-row > span:nth-child(4) { justify-self: end; }
+  .table-row > span:nth-child(6) { justify-self: end; }
   .form-grid, .claude-mapping-grid { grid-template-columns: 1fr; gap: 0; }
   .step { font-size: 0; }
   .step span { font-size: 10px; }

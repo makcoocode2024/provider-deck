@@ -5,6 +5,7 @@ import type {
   BackupRecord,
   ClientDescriptor,
   ConfigChange,
+  LaunchOutcome,
   ProbeResult,
   Provider,
   ProviderDraft,
@@ -39,6 +40,7 @@ interface AppState {
   preview(providerId: string, clientIds: string[]): Promise<void>;
   apply(providerId: string): Promise<void>;
   restore(id: string): Promise<void>;
+  launchClient(clientId: string, providerId?: string): Promise<LaunchOutcome>;
   updateSettings(settings: AppSettings): Promise<void>;
   clearError(): void;
 }
@@ -209,6 +211,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ operation: "正在校验并恢复备份…" });
     try { await backend.restoreBackup(id); set({ backups: await backend.listBackups(), operation: undefined }); }
     catch (error) { set({ operation: undefined, error: messageOf(error) }); }
+  },
+
+  /**
+   * 启动客户端。密钥不经过前端：providerId 交给后端，后端从系统凭据库现取并注入子进程。
+   * 返回的 LaunchOutcome 只带环境变量名，不带值。
+   */
+  async launchClient(clientId, providerId) {
+    set({ operation: "正在启动客户端…", error: undefined });
+    try {
+      const outcome = await backend.launchClient(clientId, providerId);
+      set({ operation: undefined });
+      return outcome;
+    } catch (error) {
+      set({ operation: undefined, error: messageOf(error) });
+      throw error;
+    }
   },
 
   async updateSettings(settings) {

@@ -256,6 +256,19 @@ export interface ClientDescriptor {
   autoConfig: boolean;
   requiresRestart: boolean;
   guidance: string;
+  /** 启动器要拉起的可执行文件。与 detectedPath 分开：探测命中的可能是数据目录。 */
+  launchTarget?: string;
+  /** 该客户端是否会从环境变量读取 API Key。仅 true 时注入密钥才有意义。 */
+  envInjection?: boolean;
+}
+
+export interface LaunchOutcome {
+  clientId: string;
+  clientName: string;
+  launchedPath: string;
+  /** 本次注入的环境变量名。**只有名字，永远没有值** —— 这个对象会进界面和日志。 */
+  injectedVariables: string[];
+  warnings: string[];
 }
 
 export interface ConfigChange {
@@ -348,6 +361,66 @@ export interface AppSettings {
   manualReasoningLevel: ReasoningLevel;
   /** 由 `manualReasoningLevel` 派生，供 legacy fallback 使用。前端不自行计算。 */
   effectiveReasoningLevel: ReasoningLevel;
+  /** 逐模型兜底档位，优先于 `effectiveReasoningLevel`。空数组表示全部走全局档位。 */
+  reasoningFallbacks: ReasoningFallback[];
+  /** 用户自建的推理档位。空数组表示只有内置档位可用。 */
+  customReasoningTiers: CustomReasoningTier[];
+  /** 用户自建的模型名匹配兜底规则。空数组表示不做任何名称匹配。 */
+  reasoningNameRules: ReasoningNameRule[];
+}
+
+/**
+ * 用户为某个模型指定的兜底档位。后端 `model::ReasoningFallback` 的镜像。
+ *
+ * **这是用户设定，不是探测事实。** 它只在该模型的推理能力未探明时影响配置写出，
+ * 绝不进入 `ModelInfo.reasoning`，也绝不抬升 confidence。能力一旦探明就自动让位。
+ *
+ * `modelId` 全等匹配，没有前缀或大小写归一：这张表是"这一个模型"的设定，
+ * 模糊匹配由用户显式建立的 {@link ReasoningNameRule} 承担。
+ *
+ * `tierId` 可以指向内置档位（`off`/`light`/`standard`/`deep`/`max`）或任一
+ * {@link CustomReasoningTier} 的 id。指向不存在的档位不是错误，结算时降级到下一级。
+ */
+export interface ReasoningFallback {
+  modelId: string;
+  tierId: string;
+}
+
+/**
+ * 用户自建的推理档位。后端 `model::CustomReasoningTier` 的镜像。
+ *
+ * 存在的理由：内置档位只能诚实地表达 OpenAI 系的 `reasoning.effort`。Anthropic 的
+ * `budget_tokens` 和 Gemini 的 `thinkingBudget` 是具体数字，程序替用户编一个数字
+ * 属于凭空发明取值。所以这两个协议的兜底参数必须由用户自己写出来。
+ *
+ * 三个协议参数都是**协议原生形状**的 JSON，与 Adapter 产出的形状一致，例如
+ * `{"reasoning":{"effort":"xhigh"}}`。三个全空的档位引用起来必然降级。
+ */
+export interface CustomReasoningTier {
+  id: string;
+  label: string;
+  description?: string | null;
+  openaiParams?: unknown;
+  anthropicParams?: unknown;
+  geminiParams?: unknown;
+}
+
+/** 模型名匹配方式。后端 `model::NameMatchType` 的镜像，serde 为 kebab-case。 */
+export type NameMatchType = "prefix" | "contains";
+
+/**
+ * 模型名匹配兜底规则。后端 `model::ReasoningNameRule` 的镜像。
+ *
+ * **这不是"根据模型名推断能力"。** 差别在证据来源：程序不预置任何规则，初始为空表，
+ * 一条也不生成；每一条都是用户自己写下的意图，且只影响配置文件写出。
+ *
+ * 数组顺序即优先级，首个命中生效。`pattern` 匹配大小写不敏感。
+ */
+export interface ReasoningNameRule {
+  id: string;
+  pattern: string;
+  matchType: NameMatchType;
+  tierId: string;
 }
 
 export const defaultSettings: AppSettings = {
@@ -360,4 +433,7 @@ export const defaultSettings: AppSettings = {
   localProxyPort: undefined,
   manualReasoningLevel: "high",
   effectiveReasoningLevel: "high",
+  reasoningFallbacks: [],
+  customReasoningTiers: [],
+  reasoningNameRules: [],
 };

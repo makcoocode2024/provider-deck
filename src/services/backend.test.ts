@@ -42,6 +42,100 @@ describe("浏览器测试后端的设置读写", () => {
     expect(saved.effectiveReasoningLevel).toBe("medium");
     expect((await backend.getSettings()).manualReasoningLevel).toBe("medium");
   });
+
+  it("旧数据没有兜底表、规则表、档位表时都补成空数组", async () => {
+    localStorage.setItem(settingsKey, JSON.stringify({ timeoutSeconds: 20, manualReasoningLevel: "low" }));
+    const settings = await backend.getSettings();
+    expect(settings.reasoningFallbacks).toEqual([]);
+    expect(settings.reasoningNameRules).toEqual([]);
+    expect(settings.customReasoningTiers).toEqual([]);
+  });
+
+  it("旧兜底表的 level 读取时迁移成 tierId，与 Rust 侧同一套映射", async () => {
+    localStorage.setItem(settingsKey, JSON.stringify({
+      manualReasoningLevel: "low",
+      reasoningFallbacks: [
+        { modelId: "a", level: "low" },
+        { modelId: "b", level: "medium" },
+        { modelId: "c", level: "high" },
+        // 两个字段同时存在时 tierId 胜出：那是新版写出的值，level 只是残留。
+        { modelId: "d", level: "low", tierId: "max" },
+      ],
+    }));
+
+    expect((await backend.getSettings()).reasoningFallbacks).toEqual([
+      { modelId: "a", tierId: "light" },
+      { modelId: "b", tierId: "standard" },
+      { modelId: "c", tierId: "deep" },
+      { modelId: "d", tierId: "max" },
+    ]);
+  });
+
+  it("兜底表按后端同一套规则归一化后存盘", async () => {
+    const saved = await backend.saveSettings({
+      ...defaultSettings,
+      reasoningFallbacks: [
+        { modelId: " padded-model ", tierId: "light" },
+        { modelId: "", tierId: "deep" },
+        { modelId: "dup", tierId: "light" },
+        { modelId: "dup", tierId: "deep" },
+      ],
+    });
+
+    expect(saved.reasoningFallbacks).toEqual([
+      { modelId: "padded-model", tierId: "light" },
+      { modelId: "dup", tierId: "deep" },
+    ]);
+    expect((await backend.getSettings()).reasoningFallbacks).toEqual(saved.reasoningFallbacks);
+  });
+
+  it("指向已删除档位的兜底记录照样存盘，不在保存时被抹掉", async () => {
+    // 抹掉等于用户重建同名档位后兜底不会自动恢复。悬空引用交给结算时降级。
+    const saved = await backend.saveSettings({
+      ...defaultSettings,
+      reasoningFallbacks: [{ modelId: "glm-4-plus", tierId: "deleted-tier" }],
+      reasoningNameRules: [{ id: "r", pattern: "glm-", matchType: "prefix", tierId: "also-deleted" }],
+    });
+
+    expect(saved.reasoningFallbacks).toEqual([{ modelId: "glm-4-plus", tierId: "deleted-tier" }]);
+    expect(saved.reasoningNameRules).toEqual([
+      { id: "r", pattern: "glm-", matchType: "prefix", tierId: "also-deleted" },
+    ]);
+  });
+
+  it("规则表保留顺序和重复，只丢掉不可能命中的空行", async () => {
+    const saved = await backend.saveSettings({
+      ...defaultSettings,
+      reasoningNameRules: [
+        { id: "r1", pattern: " glm- ", matchType: "prefix", tierId: " deep " },
+        { id: "r2", pattern: "   ", matchType: "contains", tierId: "light" },
+        { id: "r3", pattern: "thinking", matchType: "contains", tierId: "  " },
+        { id: "r4", pattern: "glm-", matchType: "prefix", tierId: "light" },
+      ],
+    });
+
+    // r1 与 r4 是同一个 pattern，但顺序即优先级，去重会改变用户表达的意图。
+    expect(saved.reasoningNameRules).toEqual([
+      { id: "r1", pattern: "glm-", matchType: "prefix", tierId: "deep" },
+      { id: "r4", pattern: "glm-", matchType: "prefix", tierId: "light" },
+    ]);
+    expect((await backend.getSettings()).reasoningNameRules).toEqual(saved.reasoningNameRules);
+  });
+
+  it("自定义档位只 trim 名字，协议参数原样保存", async () => {
+    const params = { reasoning: { effort: "xhigh" } };
+    const saved = await backend.saveSettings({
+      ...defaultSettings,
+      customReasoningTiers: [
+        { id: " tier-x ", label: " 超深 ", openaiParams: params },
+        { id: "   ", label: "无 id", openaiParams: params },
+      ],
+    });
+
+    // 本项目不维护各家网关的参数字典，所以参数内容一个字都不改写。
+    expect(saved.customReasoningTiers).toEqual([{ id: "tier-x", label: "超深", openaiParams: params }]);
+    expect((await backend.getSettings()).customReasoningTiers).toEqual(saved.customReasoningTiers);
+  });
 });
 
 // —— 运行时验证的两套后端。

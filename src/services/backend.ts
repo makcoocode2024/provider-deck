@@ -11,16 +11,18 @@ import type {
   ClientDescriptor,
   ConfigChange,
   ProbeResult,
+  LaunchOutcome,
   Provider,
   ProviderDraft,
   ProviderTestReport,
   ReasoningCapability,
+  ReasoningFallback,
   ReasoningTier,
   RuntimeVerification,
   VerificationResult,
 } from "../domain/types";
 import { defaultSettings } from "../domain/types";
-import { appendVerification } from "../domain/reasoning";
+import { appendVerification, upsertFallback } from "../domain/reasoning";
 import { normalizeBaseUrl } from "../domain/url";
 
 /**
@@ -111,6 +113,7 @@ export interface AppBackend {
   verifyModelReasoning(providerId: string, modelId: string, tier: ReasoningTier): Promise<RuntimeVerification>;
   testProvider(providerId: string, modelId?: string): Promise<ProviderTestReport>;
   detectClients(): Promise<ClientDescriptor[]>;
+  launchClient(clientId: string, providerId?: string): Promise<LaunchOutcome>;
   previewChanges(providerId: string, clientIds: string[]): Promise<ConfigChange[]>;
   applyChanges(providerId: string, changes: ConfigChange[]): Promise<ApplyResult[]>;
   listBackups(): Promise<BackupRecord[]>;
@@ -147,6 +150,9 @@ class TauriBackend implements AppBackend {
     invoke<RuntimeVerification>("verify_model_reasoning", { providerId, modelId, tier });
   testProvider = (providerId: string, modelId?: string) => invoke<ProviderTestReport>("test_provider", { providerId, modelId });
   detectClients = () => invoke<ClientDescriptor[]>("detect_clients");
+  // camelCase 同上：Tauri 2 负责映射到 Rust 的 snake_case 参数名。
+  launchClient = (clientId: string, providerId?: string) =>
+    invoke<LaunchOutcome>("launch_client", { clientId, providerId });
   previewChanges = (providerId: string, clientIds: string[]) =>
     invoke<ConfigChange[]>("preview_changes", { providerId, clientIds });
   applyChanges = (providerId: string, changes: ConfigChange[]) =>
@@ -164,6 +170,17 @@ class TauriBackend implements AppBackend {
   exportProviders = () => invoke<string>("export_providers");
   importProviders = (payload: string) => invoke<Provider[]>("import_providers", { payload });
   diagnostics = () => invoke<Record<string, string>>("diagnostics");
+}
+
+/**
+ * 旧兜底记录的 `level` → `tierId` 迁移，镜像后端 `ReasoningFallback` 的兼容反序列化。
+ * 两个字段同时存在时 tierId 胜出：那是新版写出的数据，level 只是残留。
+ */
+const legacyTierIds: Record<string, string> = { low: "light", medium: "standard", high: "deep" };
+
+function migrateFallback(item: ReasoningFallback & { level?: string }): ReasoningFallback {
+  const tierId = item.tierId ?? (item.level ? legacyTierIds[item.level] : undefined);
+  return { modelId: item.modelId, tierId: tierId ?? "" };
 }
 
 class BrowserBackend implements AppBackend {
@@ -389,9 +406,27 @@ class BrowserBackend implements AppBackend {
       autoConfig: definition.autoConfig,
       requiresRestart: definition.requiresRestart,
       guidance: definition.guidance,
+      envInjection: definition.envInjection ?? false,
       installed: index < 2,
       detectedPath: index < 2 ? `C:\\Tools\\${definition.id}.exe` : undefined,
+      launchTarget: index < 2 ? `C:\\Tools\\${definition.id}.exe` : undefined,
     }));
+  }
+
+  async launchClient(clientId: string, providerId?: string): Promise<LaunchOutcome> {
+    void providerId;
+    this.ensureTestMode();
+    const client = clientCatalog.find((item) => item.id === clientId);
+    if (!client) throw new Error(`未知客户端：${clientId}`);
+    // 浏览器模式不能 spawn 进程，也不该假装注入成功。injectedVariables 保持为空，
+    // 免得 E2E 断言出一个真实后端上不会出现的状态。
+    return {
+      clientId,
+      clientName: client.name,
+      launchedPath: "浏览器预览模式不启动进程",
+      injectedVariables: [],
+      warnings: ["浏览器预览模式不启动本机进程。启动客户端需要 Tauri 桌面后端。"],
+    };
   }
 
   async previewChanges(_providerId: string, clientIds: string[]) {
@@ -406,7 +441,14 @@ class BrowserBackend implements AppBackend {
         format: client.autoConfig ? (clientId === "codex-cli" ? "toml" : "json") : "manual",
         beforePreview: "# 保留现有配置",
         afterPreview: "+ 已添加 Provider Deck 配置（密钥已隐藏）",
-        warnings: client.autoConfig ? [] : [client.guidance],
+        // codex-cli 的两条与 Rust 侧 config::preview 同源：那边走环境变量鉴权，
+        // 配置文件里不写明文密钥，界面上必须标出来，也必须说清独立终端会失效。
+        warnings: clientId === "codex-cli"
+          ? [
+              "环境变量鉴权模式，无明文密钥写入本地文件。配置只写变量名 PROVIDER_DECK_CODEX_API_KEY，密钥在本工具拉起 Codex 时从系统凭据库注入子进程。",
+              "代价：独立终端手动执行 codex 会提示环境变量缺失——该字段是硬要求，Codex 不会回落到其他鉴权方式。",
+            ]
+          : client.autoConfig ? [] : [client.guidance],
       } as ConfigChange;
     });
   }
@@ -460,15 +502,36 @@ class BrowserBackend implements AppBackend {
   }
   async getSettings(): Promise<AppSettings> {
     const stored = localStorage.getItem(this.settingsKey);
-    return { ...defaultSettings, ...(stored ? JSON.parse(stored) : {}) };
+    const merged = { ...defaultSettings, ...(stored ? JSON.parse(stored) : {}) } as AppSettings;
+    // 旧数据里兜底档位存的是 level（low/medium/high）。桌面版由 Rust 的兼容
+    // 反序列化处理，浏览器模式必须在这里做同一件事，否则 e2e 和桌面版对同一份
+    // 旧 localStorage 会得出不同结果。映射与 `ReasoningTier::from_legacy` 一致。
+    return { ...merged, reasoningFallbacks: (merged.reasoningFallbacks ?? []).map(migrateFallback) };
   }
   async saveSettings(settings: AppSettings) {
     if (localStorage.getItem("provider-deck.e2e.fail-settings-save") === "1") {
       throw new Error("测试后端模拟设置保存失败");
     }
+    // 与后端 `reasoning::refresh_settings` 保持同一套归一化：effectiveReasoningLevel
+    // 跟随手动档，兜底表 trim + 丢空 + 同模型保留最后一条。浏览器模式如果不做这一步，
+    // e2e 里看到的存盘结果会和桌面版不一样。upsertFallback 正好是这三条规则。
+    //
+    // 规则表与档位表同样只做机械清理，且**不校验 tierId 指向的档位是否存在**：
+    // 那属于结算时的降级，在保存时抹掉会让用户重建档位后兜底不自动恢复。
     const resolved: AppSettings = {
       ...settings,
       effectiveReasoningLevel: settings.manualReasoningLevel,
+      reasoningFallbacks: (settings.reasoningFallbacks ?? []).reduce<ReasoningFallback[]>(
+        (list, item) => upsertFallback(list, { modelId: item.modelId, tierId: item.tierId.trim() }),
+        [],
+      ),
+      // 顺序即优先级，所以这里保留顺序也保留重复，只丢掉不可能命中的空行。
+      reasoningNameRules: (settings.reasoningNameRules ?? [])
+        .map((rule) => ({ ...rule, pattern: rule.pattern.trim(), tierId: rule.tierId.trim() }))
+        .filter((rule) => rule.pattern && rule.tierId),
+      customReasoningTiers: (settings.customReasoningTiers ?? [])
+        .map((tier) => ({ ...tier, id: tier.id.trim(), label: tier.label.trim() }))
+        .filter((tier) => tier.id),
     };
     localStorage.setItem(this.settingsKey, JSON.stringify(resolved));
     return resolved;

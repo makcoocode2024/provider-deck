@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::reasoning_capability::ReasoningCapability;
+use crate::reasoning_capability::{ReasoningCapability, ReasoningTier};
 use crate::reasoning_selection::ReasoningSelection;
 use crate::reasoning_verification::RuntimeVerification;
 
@@ -82,6 +82,128 @@ impl ReasoningLevel {
             Self::Medium => "medium",
             Self::High => "high",
         }
+    }
+}
+
+/// 用户为某个具体模型指定的兜底档位。
+///
+/// 三点定性：
+///
+/// 1. **这是用户设定，不是探测事实。** 它绝不写进 `ModelInfo.reasoning`，也绝不影响
+///    confidence。能力探明之后它自动失效——不需要迁移代码，`config::codex_reasoning`
+///    只在能力缺失或 Unknown 时才看它。
+/// 2. **按精确 `model_id` 匹配。** 这条不因为新增了名称规则而放松：本结构仍然只做全等
+///    比较。模糊匹配是 [`ReasoningNameRule`] 的职责，两者刻意分成两张表，因为它们的
+///    风险等级不同——全等匹配不可能误伤别的模型，模式匹配可能。
+/// 3. **档位用 `tier_id` 而不是具体参数。** 内置档位用固定 id（off/light/standard/
+///    deep/max），自定义档位用其 uuid。存 id 而不存参数：用户改了自定义档位的参数，
+///    引用它的规则应当自动跟到新值。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningFallback {
+    pub model_id: String,
+    pub tier_id: String,
+}
+
+/// 旧字段 `level: "low"|"medium"|"high"` 到 `tier_id` 的兼容读取。
+///
+/// 手写 `Deserialize` 而不是留一个 `Option<ReasoningLevel>` 影子字段：影子字段会一直
+/// 留在序列化输出里，下一个读到它的人无从判断哪个才是权威值。这里在**入口**一次性
+/// 归一，落盘就只有 `tierId`。
+impl<'de> Deserialize<'de> for ReasoningFallback {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            #[serde(default)]
+            model_id: String,
+            #[serde(default)]
+            tier_id: Option<String>,
+            /// 只读不写。旧 state.json 里这一档是 ReasoningLevel。
+            #[serde(default)]
+            level: Option<ReasoningLevel>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        // tierId 优先：两者都在时说明是新版写出的文件，level 只是残留。
+        let tier_id = raw.tier_id
+            .or_else(|| raw.level.map(|level| ReasoningTier::from_legacy(level).as_str().to_owned()))
+            .unwrap_or_default();
+        Ok(Self { model_id: raw.model_id, tier_id })
+    }
+}
+
+/// 模型名匹配方式。只有这两种，刻意不提供正则：
+/// 正则的误伤范围无法在界面上预估，而这张表的每一条都会影响配置写出。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NameMatchType {
+    Prefix,
+    Contains,
+}
+
+impl NameMatchType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Prefix => "前缀匹配",
+            Self::Contains => "包含匹配",
+        }
+    }
+}
+
+/// 按模型名匹配的兜底规则。
+///
+/// **这不是"根据模型名推断能力"。** 区别在于证据来源：推断是程序自己认为
+/// `xxx-thinking` 大概支持推理；本规则是用户明确写下"我这批模型名以 x 开头的，配置里
+/// 按这个档位写"。程序不预置任何规则，初始为空表，一条也不生成。
+///
+/// 命中结果只影响配置文件写出，绝不写进 `ModelInfo.reasoning`，也绝不影响
+/// confidence——它连 `ReasoningSupport` 都不会去改。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningNameRule {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default = "default_match_type")]
+    pub match_type: NameMatchType,
+    /// 引用的档位 id：内置固定 id 或自定义档位的 uuid。
+    /// 被引用的档位删掉之后这里会指向不存在的 id，此时整条规则跳过，不报错。
+    #[serde(default)]
+    pub tier_id: String,
+}
+
+fn default_match_type() -> NameMatchType { NameMatchType::Prefix }
+
+/// 用户自定义的推理档位。
+///
+/// 存在的理由：内置 5 档只能映射成 OpenAI 的 effort 词表，因为「深度推理对应多少
+/// budget_tokens」在未探明的模型上没有任何证据可依。用户知道自己那个网关认什么，
+/// 就让用户直接写协议参数——这是把"取值必须有出处"的出处换成用户，而不是取消它。
+///
+/// 三个协议参数各自独立且都可为空：只填 openai 的档位在 Anthropic 端点上不生效，
+/// 走降级链而不是硬套一个编造的值。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomReasoningTier {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub openai_params: Option<serde_json::Value>,
+    #[serde(default)]
+    pub anthropic_params: Option<serde_json::Value>,
+    #[serde(default)]
+    pub gemini_params: Option<serde_json::Value>,
+}
+
+impl CustomReasoningTier {
+    /// 该档位是否为任何协议配了参数。全空的档位保存不了，也不该出现在下拉里。
+    pub fn has_any_params(&self) -> bool {
+        self.openai_params.is_some() || self.anthropic_params.is_some() || self.gemini_params.is_some()
     }
 }
 
@@ -196,20 +318,78 @@ pub struct ProviderTestReport {
     pub reply_preview: Option<String>,
 }
 
+/// 客户端适配级别。
+///
+/// 四档而不是"自动/手动"两档：`auto_config` 已经是那条布尔轴，这里区分的是
+/// 适配器的核实程度——`verified` 的配置格式经过核对，`experimental` 的没有，
+/// 两者的 `auto_config` 可以都为 true 但风险不同。合并成两档会让
+/// codex-cli 与 gemini-cli 在界面上无法区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SupportLevel {
+    Verified,
+    Experimental,
+    /// 只检测和拉起，不写任何配置。
+    #[default]
+    Manual,
+    Unsupported,
+}
+
+impl SupportLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Experimental => "experimental",
+            Self::Manual => "manual",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// 客户端探测结果。
+///
+/// 只由 `clients::detect_all` 现场生成，从不进 `state.json`——所以字段增删不涉及
+/// 存量数据迁移。`#[serde(default)]` 仍然全字段带上：这个结构会跨 IPC 到前端，
+/// 旧前端缓存或回放的 JSON 少字段时应当降级，而不是整条反序列化失败。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientDescriptor {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub platforms: Vec<String>,
+    #[serde(default)]
     pub protocols: Vec<ProtocolKind>,
+    #[serde(default)]
     pub installed: bool,
+    #[serde(default)]
     pub detected_path: Option<String>,
+    #[serde(default)]
     pub config_path: Option<String>,
-    pub support: String,
+    /// 适配级别。缺省 `Manual`——少了这个字段时按"只读不写"降级，
+    /// 反过来默认成 `Verified` 会让一个来路不明的客户端拿到写入资格。
+    #[serde(default)]
+    pub support: SupportLevel,
+    #[serde(default)]
     pub auto_config: bool,
+    #[serde(default)]
     pub requires_restart: bool,
+    #[serde(default)]
     pub guidance: String,
+    /// 启动器要拉起的可执行文件。
+    ///
+    /// 与 `detected_path` 分开：探测命中的可能是数据目录而不是可执行文件
+    /// （MSIX 封装就是这样），拿它去 spawn 必然失败。None 表示无法可靠拉起。
+    #[serde(default)]
+    pub launch_target: Option<String>,
+    /// 该客户端是否会从环境变量读取 API Key。
+    ///
+    /// 只有为 true 时启动器注入密钥才有意义。否则密钥进了子进程环境也没人读，
+    /// 白担一份暴露风险——同一用户的任何进程都能看到子进程的环境块。
+    #[serde(default)]
+    pub env_injection: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +447,20 @@ pub struct AppSettings {
     /// 由 `manual_reasoning_level` 结算而来，供 `resolve_binding` 作 legacy fallback。
     #[serde(default)]
     pub effective_reasoning_level: ReasoningLevel,
+    /// 逐模型兜底档位，优先于全局的 `effective_reasoning_level`。
+    ///
+    /// 放 AppSettings 而不是 Provider：同一个模型 id 常在多个中转网关下出现，
+    /// 用户对"这个模型该用什么档"的判断跟着模型走，不跟着 endpoint 走。
+    /// 这与 `ReasoningCapability` 按 `(base_url, model_id)` 索引刻意相反——
+    /// 能力是某个端点上的事实，兜底是用户对模型的意图。
+    #[serde(default)]
+    pub reasoning_fallbacks: Vec<ReasoningFallback>,
+    /// 用户自定义的推理档位，供兜底引用。默认空表，程序不预置任何一条。
+    #[serde(default)]
+    pub custom_reasoning_tiers: Vec<CustomReasoningTier>,
+    /// 模型名匹配兜底规则，按数组顺序匹配。默认空表，程序不预置任何一条。
+    #[serde(default)]
+    pub reasoning_name_rules: Vec<ReasoningNameRule>,
 }
 
 impl Default for AppSettings {
@@ -281,7 +475,28 @@ impl Default for AppSettings {
             local_proxy_port: None,
             manual_reasoning_level: ReasoningLevel::High,
             effective_reasoning_level: ReasoningLevel::High,
+            reasoning_fallbacks: Vec::new(),
+            custom_reasoning_tiers: Vec::new(),
+            reasoning_name_rules: Vec::new(),
         }
+    }
+}
+
+impl AppSettings {
+    /// 查这个模型有没有用户指定的兜底档位，返回它引用的档位 id。
+    ///
+    /// 全等匹配，绝不做前缀或模糊匹配——见 [`ReasoningFallback`] 第 2 点。
+    /// 同一个 model_id 出现多条时取第一条：保存侧已经去重，这里不再报错，
+    /// 因为读路径在配置写出的中途，报错会让整个预览失败。
+    pub fn reasoning_fallback_for(&self, model_id: &str) -> Option<&str> {
+        self.reasoning_fallbacks.iter()
+            .find(|item| item.model_id == model_id)
+            .map(|item| item.tier_id.as_str())
+    }
+
+    /// 按 id 找自定义档位。
+    pub fn custom_tier(&self, tier_id: &str) -> Option<&CustomReasoningTier> {
+        self.custom_reasoning_tiers.iter().find(|item| item.id == tier_id)
     }
 }
 
@@ -320,5 +535,136 @@ mod tests {
         assert_eq!(settings.manual_reasoning_level, ReasoningLevel::Low);
         assert_eq!(settings.effective_reasoning_level, ReasoningLevel::Medium);
         assert_eq!(settings.timeout_seconds, 20);
+        // 旧文件里没有 reasoningFallbacks，必须默认为空而不是加载失败。
+        assert!(settings.reasoning_fallbacks.is_empty());
+    }
+
+    /// 兜底表按 camelCase 出入，与前端 types.ts 的 ReasoningFallback 对齐。
+    /// 键名写错会让设置静默丢失——序列化一轮能立刻发现。
+    #[test]
+    fn reasoning_fallbacks_round_trip_in_camel_case() {
+        let settings = AppSettings {
+            reasoning_fallbacks: vec![ReasoningFallback { model_id: "coder".into(), tier_id: "light".into() }],
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("序列化失败");
+        assert!(json.contains("\"reasoningFallbacks\""), "字段名不是 camelCase：{json}");
+        assert!(json.contains("\"modelId\":\"coder\""));
+        assert!(json.contains("\"tierId\":\"light\""));
+        // 迁移完成后不再写出 level，避免落盘里同时存在两个档位来源。
+        assert!(!json.contains("\"level\":"), "仍在写出已迁移的 level 字段：{json}");
+
+        let restored: AppSettings = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(restored.reasoning_fallbacks, settings.reasoning_fallbacks);
+        assert_eq!(restored.reasoning_fallback_for("coder"), Some("light"));
+    }
+
+    /// 上一版写出的 `level` 必须平滑读成 tier_id：用户已经设好的兜底不能因为
+    /// 字段改名而丢失。low→light / medium→standard / high→deep，与
+    /// `ReasoningTier::from_legacy` 同一套映射。
+    #[test]
+    fn legacy_level_field_migrates_to_tier_id() {
+        let legacy = r#"{
+            "timeoutSeconds": 10, "proxyUrl": "", "allowSelfSignedCertificates": false,
+            "generateOnly": true, "clearClipboardSeconds": 30, "locale": "zh-CN",
+            "reasoningFallbacks": [
+                {"modelId": "a", "level": "low"},
+                {"modelId": "b", "level": "medium"},
+                {"modelId": "c", "level": "high"}
+            ]
+        }"#;
+        let settings: AppSettings = serde_json::from_str(legacy).expect("旧兜底表无法加载");
+        assert_eq!(settings.reasoning_fallback_for("a"), Some("light"));
+        assert_eq!(settings.reasoning_fallback_for("b"), Some("standard"));
+        assert_eq!(settings.reasoning_fallback_for("c"), Some("deep"));
+    }
+
+    /// 同时存在两个字段时 tierId 胜出：那是新版写出的文件，level 只是残留。
+    #[test]
+    fn tier_id_wins_over_leftover_level() {
+        let both = r#"[{"modelId": "a", "tierId": "max", "level": "low"}]"#;
+        let list: Vec<ReasoningFallback> = serde_json::from_str(both).expect("反序列化失败");
+        assert_eq!(list[0].tier_id, "max");
+    }
+
+    /// 空 model_id 查不到东西。空串是 UI 上"还没填模型名"的那一行，
+    /// 它绝不能意外命中所有模型。
+    #[test]
+    fn empty_model_id_never_matches() {
+        let settings = AppSettings {
+            reasoning_fallbacks: vec![ReasoningFallback { model_id: String::new(), tier_id: "light".into() }],
+            ..AppSettings::default()
+        };
+        assert_eq!(settings.reasoning_fallback_for("coder"), None);
+    }
+
+    /// 默认设置里三张用户表全空。有任何一条内置规则，就等于程序在替用户
+    /// 猜模型能力——那是本次改动的红线。
+    #[test]
+    fn defaults_ship_no_builtin_rules_or_tiers() {
+        let settings = AppSettings::default();
+        assert!(settings.reasoning_fallbacks.is_empty());
+        assert!(settings.custom_reasoning_tiers.is_empty());
+        assert!(settings.reasoning_name_rules.is_empty());
+    }
+
+    /// 旧 state.json 完全没有这三个键时全部默认为空，行为与旧版本一致。
+    #[test]
+    fn legacy_settings_without_new_tables_load_as_empty() {
+        let legacy = r#"{
+            "timeoutSeconds": 20, "proxyUrl": "", "allowSelfSignedCertificates": false,
+            "generateOnly": true, "clearClipboardSeconds": 30, "locale": "zh-CN",
+            "manualReasoningLevel": "low", "effectiveReasoningLevel": "medium"
+        }"#;
+        let settings: AppSettings = serde_json::from_str(legacy).expect("旧 state.json 无法加载");
+        assert!(settings.custom_reasoning_tiers.is_empty());
+        assert!(settings.reasoning_name_rules.is_empty());
+        assert!(settings.reasoning_fallbacks.is_empty());
+        assert_eq!(settings.manual_reasoning_level, ReasoningLevel::Low);
+    }
+
+    /// 新表的序列化契约：camelCase + kebab-case 的 matchType + 三个协议参数键名。
+    #[test]
+    fn new_tables_round_trip_in_camel_case() {
+        let settings = AppSettings {
+            custom_reasoning_tiers: vec![CustomReasoningTier {
+                id: "tier-1".into(),
+                label: "超深".into(),
+                description: Some("给自建网关用".into()),
+                openai_params: Some(serde_json::json!({"reasoning": {"effort": "xhigh"}})),
+                anthropic_params: None,
+                gemini_params: None,
+            }],
+            reasoning_name_rules: vec![ReasoningNameRule {
+                id: "rule-1".into(),
+                pattern: "glm-".into(),
+                match_type: NameMatchType::Prefix,
+                tier_id: "tier-1".into(),
+            }],
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("序列化失败");
+        assert!(json.contains("\"customReasoningTiers\""), "{json}");
+        assert!(json.contains("\"reasoningNameRules\""), "{json}");
+        assert!(json.contains("\"openaiParams\""), "{json}");
+        assert!(json.contains("\"anthropicParams\":null"), "{json}");
+        assert!(json.contains("\"matchType\":\"prefix\""), "{json}");
+
+        let restored: AppSettings = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(restored.custom_reasoning_tiers, settings.custom_reasoning_tiers);
+        assert_eq!(restored.reasoning_name_rules, settings.reasoning_name_rules);
+        assert!(restored.custom_tier("tier-1").is_some());
+        assert!(restored.custom_tier("missing").is_none());
+    }
+
+    /// 三个协议参数全空的自定义档位是无效档位——它引用起来必然降级。
+    #[test]
+    fn a_custom_tier_without_any_params_is_useless() {
+        let empty = CustomReasoningTier {
+            id: "t".into(), label: "空".into(), description: None,
+            openai_params: None, anthropic_params: None, gemini_params: None,
+        };
+        assert!(!empty.has_any_params());
+        assert!(CustomReasoningTier { openai_params: Some(serde_json::json!({})), ..empty }.has_any_params());
     }
 }

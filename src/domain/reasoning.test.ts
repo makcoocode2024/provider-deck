@@ -1,16 +1,37 @@
 import { describe, expect, it } from "vitest";
-import type { ReasoningCapability, ReasoningSelection, ReasoningTier, RuntimeVerification, VerificationResult } from "./types";
+import type {
+  CustomReasoningTier,
+  ReasoningCapability,
+  ReasoningFallback,
+  ReasoningLevel,
+  ReasoningNameRule,
+  ReasoningSelection,
+  ReasoningTier,
+  RuntimeVerification,
+  VerificationResult,
+} from "./types";
+import type { FallbackSettings } from "./reasoning";
 import {
   advancedOptions,
   appendVerification,
   budgetRange,
+  builtinReasoningTiers,
   canDisableReasoning,
   canSelectTier,
+  effectiveFallbackTier,
+  fallbackFor,
+  fallbackNotice,
   hasDynamicBudget,
   latestVerification,
   latestVerificationForTier,
+  matchNameRule,
+  originLabel,
+  reasoningOrigin,
   reasoningUiState,
+  removeFallback,
+  resolveTierLabel,
   tierOptions,
+  upsertFallback,
   verifiableTier,
   verificationSummary,
   verificationTierLabel,
@@ -302,5 +323,214 @@ describe("verificationSummary", () => {
       const summary = verificationSummary(record, supportedCapability);
       expect(`${summary.label}${summary.detail ?? ""}`).not.toContain("不支持");
     }
+  });
+});
+
+describe("兜底档位与已探明档位的区分", () => {
+  const settings = (fallbacks: ReasoningFallback[], level: ReasoningLevel = "medium"): FallbackSettings =>
+    ({ effectiveReasoningLevel: level, reasoningFallbacks: fallbacks });
+  const unknownCapability: ReasoningCapability = { ...supportedCapability, support: "unknown", tiers: [], confidence: "unknown" };
+  const unsupportedCapability: ReasoningCapability = { ...supportedCapability, support: "unsupported", tiers: [] };
+
+  it("能力未探明且有逐模型设定：用该设定，来源标成用户设定", () => {
+    const state = settings([{ modelId: "test-coder", tierId: "deep" }]);
+    expect(reasoningOrigin(unknownCapability, state, "test-coder")).toBe("model-fallback");
+    expect(effectiveFallbackTier(unknownCapability, state, "test-coder")).toEqual({ label: "高", custom: false });
+    expect(originLabel("model-fallback")).toContain("用户");
+  });
+
+  it("能力未探明且没有逐模型设定：退到全局回退档", () => {
+    const state = settings([], "low");
+    expect(reasoningOrigin(unknownCapability, state, "test-coder")).toBe("global-fallback");
+    expect(effectiveFallbackTier(unknownCapability, state, "test-coder")).toEqual({ label: "low", custom: false });
+  });
+
+  it("能力缺失（从未探测）同样走兜底", () => {
+    const state = settings([{ modelId: "test-coder", tierId: "deep" }]);
+    expect(reasoningOrigin(undefined, state, "test-coder")).toBe("model-fallback");
+    expect(reasoningOrigin(null, settings([]), "test-coder")).toBe("global-fallback");
+  });
+
+  it("已探明支持：兜底完全不参与，即便用户为这个模型设了值", () => {
+    const state = settings([{ modelId: "test-coder", tierId: "deep" }]);
+    expect(reasoningOrigin(supportedCapability, state, "test-coder")).toBe("discovered");
+    expect(effectiveFallbackTier(supportedCapability, state, "test-coder")).toBeUndefined();
+    expect(fallbackNotice(supportedCapability, state, "test-coder")).toBeUndefined();
+  });
+
+  it("已探明不支持：用户兜底不覆盖这个事实", () => {
+    const state = settings([{ modelId: "test-coder", tierId: "deep" }]);
+    expect(reasoningOrigin(unsupportedCapability, state, "test-coder")).toBe("omitted");
+    expect(effectiveFallbackTier(unsupportedCapability, state, "test-coder")).toBeUndefined();
+    expect(fallbackNotice(unsupportedCapability, state, "test-coder")).toBeUndefined();
+  });
+
+  it("声明支持却没有可用档位：也不套兜底，与后端一致地省略", () => {
+    const empty: ReasoningCapability = { ...supportedCapability, tiers: [], defaultTier: undefined };
+    expect(reasoningUiState(empty)).toBe("empty");
+    expect(reasoningOrigin(empty, settings([{ modelId: "test-coder", tierId: "deep" }]), "test-coder")).toBe("omitted");
+  });
+
+  it("modelId 全等匹配，前后空格和大小写都不命中", () => {
+    const fallbacks: ReasoningFallback[] = [{ modelId: "test-coder", tierId: "deep" }];
+    expect(fallbackFor(fallbacks, "test-coder")).toBe("deep");
+    for (const candidate of ["test-coder-v2", "test-code", "Test-Coder", "TEST-CODER", " test-coder", "test-coder "]) {
+      expect(fallbackFor(fallbacks, candidate)).toBeUndefined();
+    }
+    expect(fallbackFor(fallbacks, undefined)).toBeUndefined();
+    expect(fallbackFor(undefined, "test-coder")).toBeUndefined();
+  });
+
+  it("兜底措辞不复用 confidence 的任何用词", () => {
+    const notice = fallbackNotice(unknownCapability, settings([]), "test-coder");
+    expect(notice).toBeDefined();
+    for (const word of ["声明", "校验", "证实", "已探明"]) {
+      expect(notice?.label).not.toContain(word);
+    }
+    expect(notice?.label).toContain("兜底");
+    expect(notice?.tier).toBe("medium");
+    // 「支持/兼容/已确认」是事实性措辞，兜底文案里一个都不许出现。
+    for (const word of ["支持", "兼容", "已确认"]) {
+      expect(notice?.message).not.toContain(word);
+    }
+    expect(notice?.message).toContain("仅配置生效");
+  });
+
+  it("upsert 同一模型只留一条，并 trim modelId", () => {
+    let list = upsertFallback([], { modelId: " test-coder ", tierId: "light" });
+    expect(list).toEqual([{ modelId: "test-coder", tierId: "light" }]);
+    list = upsertFallback(list, { modelId: "test-coder", tierId: "deep" });
+    expect(list).toEqual([{ modelId: "test-coder", tierId: "deep" }]);
+    list = upsertFallback(list, { modelId: "other", tierId: "standard" });
+    expect(list).toHaveLength(2);
+  });
+
+  it("upsert 忽略空 modelId，remove 只删指定模型", () => {
+    const list: ReasoningFallback[] = [{ modelId: "a", tierId: "light" }, { modelId: "b", tierId: "deep" }];
+    expect(upsertFallback(list, { modelId: "   ", tierId: "deep" })).toBe(list);
+    expect(removeFallback(list, "a")).toEqual([{ modelId: "b", tierId: "deep" }]);
+    expect(removeFallback(list, "missing")).toEqual(list);
+    expect(removeFallback(undefined, "a")).toEqual([]);
+  });
+
+  it("探测成功后自动改用已探明档位，无需清理兜底表", () => {
+    const state = settings([{ modelId: "test-coder", tierId: "deep" }]);
+    expect(reasoningOrigin(unknownCapability, state, "test-coder")).toBe("model-fallback");
+    // 同一张兜底表，能力一变成 supported 就不再生效——这就是"自动升级"。
+    expect(reasoningOrigin(supportedCapability, state, "test-coder")).toBe("discovered");
+  });
+});
+
+// —— 自定义档位与模型名规则。
+//
+// 这一组的共同前提：三张表全部由用户维护，默认为空。断言分两类——
+// 一类钉住"空表时行为与旧版一致"，一类钉住"任何失效都降级而不是报错"。
+
+describe("自定义档位与模型名规则", () => {
+  const unknownCapability: ReasoningCapability = { ...supportedCapability, support: "unknown", tiers: [], confidence: "unknown" };
+  const customTier: CustomReasoningTier = {
+    id: "tier-x",
+    label: "超深",
+    openaiParams: { reasoning: { effort: "xhigh" } },
+  };
+  const base = (extra: Partial<FallbackSettings> = {}): FallbackSettings =>
+    ({ effectiveReasoningLevel: "medium", reasoningFallbacks: [], customReasoningTiers: [], reasoningNameRules: [], ...extra });
+
+  it("三张表全空时退到全局回退档，与旧版本行为一致", () => {
+    const state = base();
+    expect(reasoningOrigin(unknownCapability, state, "glm-4-plus")).toBe("global-fallback");
+    expect(effectiveFallbackTier(unknownCapability, state, "glm-4-plus")).toEqual({ label: "medium", custom: false });
+  });
+
+  it("内置档位 id 解析成中文名，自定义档位标出 custom", () => {
+    expect(resolveTierLabel("light", [])).toEqual({ label: "轻度", custom: false });
+    expect(resolveTierLabel("tier-x", [customTier])).toEqual({ label: "超深", custom: true });
+    expect(resolveTierLabel("tier-x", [])).toBeUndefined();
+    expect(resolveTierLabel(undefined, [customTier])).toBeUndefined();
+    // 名字留空时退回 id，不显示成空白。
+    expect(resolveTierLabel("t", [{ id: "t", label: "  " }])).toEqual({ label: "t", custom: true });
+  });
+
+  it("前缀与包含两种匹配都大小写不敏感", () => {
+    const rules: ReasoningNameRule[] = [
+      { id: "r1", pattern: "GLM-", matchType: "prefix", tierId: "light" },
+      { id: "r2", pattern: "THINKING", matchType: "contains", tierId: "deep" },
+    ];
+    expect(matchNameRule(rules, "glm-4-plus")?.id).toBe("r1");
+    expect(matchNameRule(rules, "qwen-thinking-max")?.id).toBe("r2");
+    // 前缀规则不该被"名字中间含有该片段"命中。
+    expect(matchNameRule(rules, "custom-glm-4")?.id).toBe(undefined);
+    expect(matchNameRule(rules, "gpt-4o")).toBeUndefined();
+    expect(matchNameRule(rules, undefined)).toBeUndefined();
+    expect(matchNameRule(undefined, "glm-4")).toBeUndefined();
+  });
+
+  it("多条规则按数组顺序取首个命中", () => {
+    const rules: ReasoningNameRule[] = [
+      { id: "first", pattern: "glm-", matchType: "prefix", tierId: "light" },
+      { id: "second", pattern: "glm-4", matchType: "prefix", tierId: "deep" },
+    ];
+    expect(matchNameRule(rules, "glm-4-plus")?.id).toBe("first");
+    // 顺序颠倒，答案跟着变——顺序就是用户表达的优先级。
+    expect(matchNameRule([rules[1], rules[0]], "glm-4-plus")?.id).toBe("second");
+  });
+
+  it("空 pattern 不参与匹配：否则它会命中一切模型", () => {
+    const rules: ReasoningNameRule[] = [{ id: "blank", pattern: "   ", matchType: "contains", tierId: "deep" }];
+    expect(matchNameRule(rules, "anything")).toBeUndefined();
+  });
+
+  it("命中名称规则时来源是 name-rule，文案用「名称规则兜底」", () => {
+    const state = base({
+      customReasoningTiers: [customTier],
+      reasoningNameRules: [{ id: "r", pattern: "glm-", matchType: "prefix", tierId: "tier-x" }],
+    });
+    expect(reasoningOrigin(unknownCapability, state, "glm-4-plus")).toBe("name-rule");
+    const notice = fallbackNotice(unknownCapability, state, "glm-4-plus");
+    expect(notice?.message).toBe("名称规则兜底：超深（仅配置生效）");
+    expect(notice?.custom).toBe(true);
+  });
+
+  it("单模型兜底压过名称规则：具体意图胜过宽泛意图", () => {
+    const state = base({
+      reasoningFallbacks: [{ modelId: "glm-4-plus", tierId: "light" }],
+      reasoningNameRules: [{ id: "r", pattern: "glm-", matchType: "prefix", tierId: "deep" }],
+    });
+    expect(reasoningOrigin(unknownCapability, state, "glm-4-plus")).toBe("model-fallback");
+    expect(fallbackNotice(unknownCapability, state, "glm-4-plus")?.message).toBe("单模型兜底档位：轻度（仅配置生效）");
+    // 同一份配置，另一个模型仍然走规则。
+    expect(reasoningOrigin(unknownCapability, state, "glm-3-turbo")).toBe("name-rule");
+  });
+
+  it("单模型兜底指向已删除的档位时降级到名称规则", () => {
+    const state = base({
+      reasoningFallbacks: [{ modelId: "glm-4-plus", tierId: "deleted" }],
+      reasoningNameRules: [{ id: "r", pattern: "glm-", matchType: "prefix", tierId: "deep" }],
+    });
+    expect(reasoningOrigin(unknownCapability, state, "glm-4-plus")).toBe("name-rule");
+    expect(effectiveFallbackTier(unknownCapability, state, "glm-4-plus")).toEqual({ label: "高", custom: false });
+  });
+
+  it("两级都指向已删除的档位时降级到全局回退档，不报错", () => {
+    const state = base({
+      reasoningFallbacks: [{ modelId: "glm-4-plus", tierId: "gone" }],
+      reasoningNameRules: [{ id: "r", pattern: "glm-", matchType: "prefix", tierId: "also-gone" }],
+    });
+    expect(reasoningOrigin(unknownCapability, state, "glm-4-plus")).toBe("global-fallback");
+    expect(fallbackNotice(unknownCapability, state, "glm-4-plus")?.message).toBe("全局回退档：medium（仅配置生效）");
+  });
+
+  it("已探明支持时，自定义档位和名称规则一律不参与", () => {
+    const state = base({
+      customReasoningTiers: [customTier],
+      reasoningNameRules: [{ id: "r", pattern: "test-", matchType: "prefix", tierId: "tier-x" }],
+    });
+    expect(reasoningOrigin(supportedCapability, state, "test-coder")).toBe("discovered");
+    expect(fallbackNotice(supportedCapability, state, "test-coder")).toBeUndefined();
+  });
+
+  it("内置档位清单是封闭的五档，顺序固定", () => {
+    expect(builtinReasoningTiers.map((tier) => tier.id)).toEqual(["off", "light", "standard", "deep", "max"]);
+    expect(builtinReasoningTiers.map((tier) => tier.label)).toEqual(["关闭", "轻度", "中度", "高", "最大"]);
   });
 });

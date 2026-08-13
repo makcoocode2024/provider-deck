@@ -151,6 +151,22 @@ impl ReasoningTier {
         }
     }
 
+    /// `as_str` 的逆运算。用户配置层（兜底表、模型名规则）用字符串引用档位，
+    /// 因为它要同时能指向内置档位和自定义档位——一个枚举装不下两者。这里负责
+    /// 判断一个 id 是否落在内置档位里；不认识返回 None，由调用方去查自定义档位表。
+    ///
+    /// 两者必须一起改：新增内置档位却忘了这里，会让引用它的规则静默失效。
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "off" => Some(Self::Off),
+            "light" => Some(Self::Light),
+            "standard" => Some(Self::Standard),
+            "deep" => Some(Self::Deep),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
     /// 沿用既有 UI 词汇（轻度／中度／高），避免无谓的用户再学习成本。
     pub fn label(self) -> &'static str {
         match self {
@@ -672,6 +688,30 @@ mod tests {
         assert_eq!(ReasoningTier::from_legacy(ReasoningLevel::High), ReasoningTier::Deep);
         assert_eq!(ReasoningTier::Off.to_legacy(), ReasoningLevel::Low);
         assert_eq!(ReasoningTier::Max.to_legacy(), ReasoningLevel::High);
+    }
+
+    /// `from_id` 必须认得每一个内置档位的 `as_str()`。漏掉一个，用户配置层里
+    /// 引用它的兜底规则就会被当成"自定义档位"去查表，查不到后静默降级。
+    #[test]
+    fn every_builtin_tier_id_round_trips() {
+        for tier in [
+            ReasoningTier::Off,
+            ReasoningTier::Light,
+            ReasoningTier::Standard,
+            ReasoningTier::Deep,
+            ReasoningTier::Max,
+        ] {
+            assert_eq!(ReasoningTier::from_id(tier.as_str()), Some(tier), "{} 不可逆", tier.as_str());
+        }
+    }
+
+    /// 不认识的 id 返回 None，不 panic、不猜最近的档位。自定义档位 id 会走到这里，
+    /// 由调用方接着查 AppSettings.custom_reasoning_tiers。
+    #[test]
+    fn unknown_tier_ids_are_not_guessed() {
+        assert_eq!(ReasoningTier::from_id(""), None);
+        assert_eq!(ReasoningTier::from_id("Light"), None, "大小写不该被容忍：id 是机器键，不是用户输入");
+        assert_eq!(ReasoningTier::from_id("my-custom-tier"), None);
     }
 
     #[test]

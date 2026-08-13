@@ -296,6 +296,154 @@ test("回退档位可以手动切换并在保存后持久化", async ({ page }, 
   await expect(page.getByLabel("手动回退档位")).toHaveValue("medium");
 });
 
+test("逐模型兜底档位可以添加、持久化并删除", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await expect(page.getByText("尚未设置逐模型兜底，未探明的模型统一按全局回退档写出。")).toBeVisible();
+
+  await page.getByLabel("兜底模型 ID").fill("relay-coder");
+  // 下拉里的取值是档位 id，不再是旧的 low/medium/high。
+  await page.getByLabel("兜底档位").selectOption("light");
+  await page.getByRole("button", { name: "添加", exact: true }).click();
+  await expect(page.getByText("relay-coder", { exact: true })).toBeVisible();
+  // 添加后输入框清空，避免连续添加时把上一条模型名带进下一条。
+  await expect(page.getByLabel("兜底模型 ID")).toHaveValue("");
+
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  if (testInfo.project.name === "narrow-chromium") await page.getByRole("button", { name: "打开导航" }).click();
+  await page.getByRole("button", { name: "设置" }).click();
+  await expect(page.getByText("relay-coder", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "删除 relay-coder 的兜底档位" }).click();
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+  await expect(page.getByText("relay-coder", { exact: true })).toHaveCount(0);
+});
+
+// 以下三例断言的是「模型名规则 + 自定义档位」这两级兜底。共同前提：两张表初始为空，
+// 不加任何配置时行为与旧版本完全一致，所以第一条断言总是那句空态文案。
+test("模型名规则可以添加、按顺序展示并删除", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await expect(page.getByText("尚未设置任何规则。不加规则时行为与旧版本完全一致。")).toBeVisible();
+
+  await page.getByLabel("匹配内容").fill("glm-");
+  await page.getByLabel("规则档位").selectOption("light");
+  await page.getByRole("button", { name: "添加规则" }).click();
+
+  await page.getByLabel("匹配方式").selectOption("contains");
+  await page.getByLabel("匹配内容").fill("thinking");
+  await page.getByLabel("规则档位").selectOption("deep");
+  await page.getByRole("button", { name: "添加规则" }).click();
+
+  // 顺序即优先级，所以列表必须按添加顺序展示，不排序也不去重。
+  const rules = page.locator("ol.fallback-list li");
+  await expect(rules).toHaveCount(2);
+  await expect(rules.nth(0)).toContainText("glm-");
+  await expect(rules.nth(1)).toContainText("thinking");
+
+  await page.getByRole("button", { name: "保存设置" }).click();
+  await expect(page.getByRole("status")).toHaveText("设置已保存");
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  if (testInfo.project.name === "narrow-chromium") await page.getByRole("button", { name: "打开导航" }).click();
+  await page.getByRole("button", { name: "设置" }).click();
+  await expect(page.locator("ol.fallback-list li")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "删除规则 glm-" }).click();
+  await expect(page.locator("ol.fallback-list li")).toHaveCount(1);
+  await expect(page.locator("ol.fallback-list li").nth(0)).toContainText("thinking");
+});
+
+test("自定义档位建好后可被规则引用", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await expect(page.getByText("尚未自建档位。兜底规则可以直接引用内置档位。")).toBeVisible();
+
+  await page.getByRole("button", { name: "新建档位" }).click();
+  await page.getByLabel("档位名称").fill("超深推理");
+  await page.getByLabel("OpenAI 协议参数").fill('{"reasoning":{"effort":"xhigh"}}');
+  await page.getByRole("button", { name: "保存档位" }).click();
+
+  // 名字同时出现在两个档位下拉和档位列表里，所以只断言列表那一处。
+  await expect(page.getByRole("listitem").getByText("超深推理", { exact: true })).toBeVisible();
+  // 建好之后立刻出现在档位下拉的「自定义档位」分组里。
+  await page.getByLabel("规则档位").selectOption({ label: "超深推理" });
+  await page.getByLabel("匹配内容").fill("glm-");
+  await page.getByRole("button", { name: "添加规则" }).click();
+  await expect(page.locator("ol.fallback-list li").nth(0)).toContainText("超深推理");
+});
+
+test("删除被引用的档位：规则保留下来并标为已删除", async ({ page }, testInfo) => {
+  await openSettings(page, testInfo);
+  await page.getByRole("button", { name: "新建档位" }).click();
+  await page.getByLabel("档位名称").fill("临时档位");
+  await page.getByLabel("OpenAI 协议参数").fill('{"reasoning":{"effort":"high"}}');
+  await page.getByRole("button", { name: "保存档位" }).click();
+
+  await page.getByLabel("规则档位").selectOption({ label: "临时档位" });
+  await page.getByLabel("匹配内容").fill("glm-");
+  await page.getByRole("button", { name: "添加规则" }).click();
+
+  await page.getByRole("button", { name: "删除档位 临时档位" }).click();
+  await expect(page.getByText("关联的兜底规则将自动降级", { exact: false })).toBeVisible();
+  await expect(page.getByText("当前有 1 条规则引用它", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "删除档位", exact: true }).click();
+
+  // 规则本身不被删除：结算时跳过这一级继续往下找，界面上标出档位已删除。
+  await expect(page.locator("ol.fallback-list li")).toHaveCount(1);
+  await expect(page.getByText("档位已删除", { exact: false })).toBeVisible();
+});
+
+async function openClients(page: import("@playwright/test").Page, testInfo: import("@playwright/test").TestInfo) {
+  await page.evaluate(() => localStorage.setItem("provider-deck.e2e.providers", JSON.stringify([{
+    id: "clients-test-provider",
+    name: "客户端测试服务",
+    baseUrl: "https://clients.example.test/v1",
+    protocol: "openai",
+    enabled: true,
+    isCurrent: true,
+    defaultModel: "test-coder",
+    models: [],
+    connectionState: "connected",
+    appliedClients: [],
+  }])));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  if (testInfo.project.name === "narrow-chromium") await page.getByRole("button", { name: "打开导航" }).click();
+  await page.getByRole("button", { name: "客户端" }).click();
+}
+
+// 以下三例覆盖桌面客户端与 Codex 环境变量鉴权的界面表现。共同前提：浏览器模式下
+// clientCatalog 的前两条（codex-cli / claude-code）被标为已安装并带 launchTarget。
+test("桌面客户端不提供写入配置的勾选框", async ({ page }, testInfo) => {
+  await openClients(page, testInfo);
+  // 自动配置的客户端有勾选框。
+  await expect(page.getByLabel("选择 OpenAI Codex CLI")).toBeVisible();
+  // 桌面端没有：勾了也只会喂给「预览配置」，而它们没有可写的配置文件。
+  await expect(page.getByLabel("选择 Claude Desktop")).toHaveCount(0);
+  await expect(page.getByLabel("选择 ChatGPT Desktop")).toHaveCount(0);
+});
+
+test("桌面客户端展示不修改登录态的引导文案", async ({ page }, testInfo) => {
+  await openClients(page, testInfo);
+  const guidance = page.getByText("本程序不修改客户端登录态，请在客户端内手动配置 API 地址与密钥", { exact: false });
+  await expect(guidance.first()).toBeVisible();
+  // 两款桌面端各一条。
+  await expect(guidance).toHaveCount(2);
+});
+
+test("Codex 卡片说明环境变量免明文配置及其代价", async ({ page }, testInfo) => {
+  await openClients(page, testInfo);
+  await expect(page.getByText("当前采用环境变量免明文配置，密钥仅在本工具拉起进程时临时注入，独立终端手动执行会提示环境变量缺失。")).toBeVisible();
+});
+
+test("配置预览标注环境变量鉴权模式", async ({ page }, testInfo) => {
+  await openClients(page, testInfo);
+  await page.getByLabel("选择 OpenAI Codex CLI").check();
+  await page.getByRole("button", { name: "预览配置" }).click();
+  await expect(page.getByText("环境变量鉴权模式，无明文密钥写入本地文件", { exact: false })).toBeVisible();
+});
+
 test("修改超时不会重置已保存的推理设置", async ({ page }, testInfo) => {
   await openSettings(page, testInfo);
   await page.getByLabel("手动回退档位").selectOption("low");

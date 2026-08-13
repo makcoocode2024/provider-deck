@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import type { ClaudeModelMappings, ClaudeModelProfile, CodexCompatibility, ModelInfo, Provider, ProviderDraft, ReasoningBinding, ReasoningTier } from "../domain/types";
-import { makeBindingSelection, makeSelection, selectionFor, upsertSelection } from "../domain/reasoning";
+import { fallbackNotice, makeBindingSelection, makeSelection, selectionFor, upsertSelection } from "../domain/reasoning";
 import { normalizeBaseUrl } from "../domain/url";
 import { backend } from "../services/backend";
 import { useAppStore } from "../state/useAppStore";
@@ -138,7 +138,7 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
   const [startingProbe, setStartingProbe] = useState(false);
   const [reprobingReasoning, setReprobingReasoning] = useState(false);
   const [verifyingReasoning, setVerifyingReasoning] = useState(false);
-  const { probe, saveProvider, reprobeModelReasoning, verifyModelReasoning, probeResult, operation, error, clearError } = useAppStore();
+  const { probe, saveProvider, reprobeModelReasoning, verifyModelReasoning, probeResult, operation, error, clearError, settings } = useAppStore();
   // 验证历史取自 store 里已保存的 provider，而不是 initial：验证会往 store 追加记录，
   // 读 initial 就看不到刚刚那一条。capability 仍走 probeResult，两条数据流各自的源不变。
   const savedProvider = useAppStore((state) => state.providers.find((item) => item.id === initial?.id));
@@ -384,6 +384,7 @@ export function ProviderWizard({ open, initial, firstRun, onOpenChange, onSaved 
                   verifications={savedProvider?.reasoningVerifications}
                   onVerify={initial?.id ? (tier) => void verifyReasoning(tier) : undefined}
                   verifying={verifyingReasoning}
+                  fallback={fallbackNotice(activeModel?.reasoning, settings, activeModelId)}
                 />
               )}
               {probeResult?.reasoningNote && <small className="reasoning-note">{probeResult.reasoningNote}</small>}

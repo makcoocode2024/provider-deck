@@ -8,6 +8,8 @@ import type {
   RuntimeVerification,
   VerificationResult,
 } from "../domain/types";
+import type { FallbackSettings } from "../domain/reasoning";
+import { fallbackNotice } from "../domain/reasoning";
 import { ReasoningTierPicker } from "./ReasoningTierPicker";
 
 describe("ReasoningTierPicker", () => {
@@ -96,6 +98,88 @@ describe("ReasoningTierPicker", () => {
     expect(screen.queryByText("轻度")).not.toBeInTheDocument();
     expect(screen.queryByText("中度")).not.toBeInTheDocument();
     expect(screen.queryByText("高")).not.toBeInTheDocument();
+  });
+});
+
+// —— 兜底档位的展示。
+//
+// 这一组的共同前提：`fallback` 是第三个独立入参，既不来自 capability 也不来自
+// verifications。断言的重点不是"显示了什么值"，而是"有没有把用户设定说成探测结论"。
+
+describe("ReasoningTierPicker 的兜底档位标记", () => {
+  afterEach(cleanup);
+  const unknownCapability: ReasoningCapability = {
+    key: { baseUrl: "https://api.example.com/v1", modelId: "test-coder" },
+    support: "unknown",
+    control: { kind: "none" },
+    tiers: [],
+    constraints: {},
+    confidence: "unknown",
+    evidence: [],
+    discoveredAt: "2026-08-12T10:00:00Z",
+    ttlSeconds: 6 * 3600,
+  };
+  const settings: FallbackSettings = {
+    effectiveReasoningLevel: "medium",
+    reasoningFallbacks: [{ modelId: "test-coder", tierId: "deep" }],
+  };
+
+  it("未探明时显示兜底档位，并注明是用户设定", () => {
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={fallbackNotice(unknownCapability, settings, "test-coder")} />);
+    expect(screen.getByText("能力未探明")).toBeInTheDocument();
+    expect(screen.getByText("高")).toBeInTheDocument();
+    expect(screen.getByText(/单模型兜底档位：高（仅配置生效）/)).toBeInTheDocument();
+    expect(screen.getByText(/仅用于写入配置文件/)).toBeInTheDocument();
+  });
+
+  it("自定义档位额外打「自定义」标记，内置档位不打", () => {
+    const custom: FallbackSettings = {
+      effectiveReasoningLevel: "medium",
+      customReasoningTiers: [{ id: "tier-x", label: "超深", openaiParams: { reasoning: { effort: "xhigh" } } }],
+      reasoningNameRules: [{ id: "r", pattern: "test-", matchType: "prefix", tierId: "tier-x" }],
+    };
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={fallbackNotice(unknownCapability, custom, "test-coder")} />);
+    expect(screen.getByText("超深")).toBeInTheDocument();
+    expect(screen.getByText(/自定义/)).toBeInTheDocument();
+    expect(screen.getByText(/名称规则兜底：超深（仅配置生效）/)).toBeInTheDocument();
+
+    cleanup();
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={fallbackNotice(unknownCapability, settings, "test-coder")} />);
+    expect(screen.queryByText(/自定义/)).not.toBeInTheDocument();
+  });
+
+  it("兜底文案不出现任何事实性措辞", () => {
+    const notice = fallbackNotice(unknownCapability, settings, "test-coder");
+    // 「支持/兼容/已确认」会让用户以为自己填的档位得到了服务端确认。
+    for (const word of ["支持", "兼容", "已确认"]) {
+      expect(notice?.message).not.toContain(word);
+    }
+    expect(notice?.message).toContain("仅配置生效");
+  });
+
+  it("兜底标记不出现 confidence 用词", () => {
+    const notice = fallbackNotice(unknownCapability, settings, "test-coder");
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} fallback={notice} />);
+    const note = screen.getByText(/单模型兜底档位/).closest("p");
+    for (const word of ["服务端声明", "参数校验确认", "真实响应证实"]) {
+      expect(note?.textContent).not.toContain(word);
+    }
+    // 徽章本身不能自称已探明。整段文字里"探测成功后自动改用已探明档位"是对未来的
+    // 说明，不是对当前状态的断言，所以只对 label 做这条断言。
+    expect(notice?.label).not.toContain("已探明");
+  });
+
+  it("已探明不支持：不渲染任何兜底提示", () => {
+    const unsupported: ReasoningCapability = { ...unknownCapability, support: "unsupported" };
+    render(<ReasoningTierPicker capability={unsupported} onChange={vi.fn()} fallback={fallbackNotice(unsupported, settings, "test-coder")} />);
+    expect(screen.getByText("此模型不支持推理")).toBeInTheDocument();
+    expect(screen.queryByText(/兜底档位/)).not.toBeInTheDocument();
+    expect(screen.queryByText("高")).not.toBeInTheDocument();
+  });
+
+  it("没有兜底入参时不多渲染一行", () => {
+    render(<ReasoningTierPicker capability={unknownCapability} onChange={vi.fn()} />);
+    expect(screen.queryByText(/兜底档位/)).not.toBeInTheDocument();
   });
 });
 
