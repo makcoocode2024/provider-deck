@@ -13,6 +13,42 @@
 **接手前先读这一节，再读第 10 节与第 11 节，然后才是第 1–9 节。** 第 1–9 节写于 2026-08-11，
 其"最新提交""下一步计划"等描述已被第 10 节取代；两处冲突时以第 10 节为准。
 
+### 0.0 当前稳定发行版与打包速查
+
+**当前稳定发行版：v0.1.12**（2026-08-13 发布，tag `v0.1.12` → `8d42a8f`）。
+产物在 `release\ProviderDeck-0.1.12-windows-x64\`：便携版 EXE、NSIS 安装版 EXE、
+README.txt、CHANGELOG.md、release-summary.txt、SHA256SUMS.txt 共六个文件。
+
+**自动版本构建怎么用 —— 两条命令，别记错：**
+
+```
+:: 发新版本（补丁号自动 +1，0.1.12 → 0.1.13）
+build_all.bat
+
+:: 重打同一个版本（补丁号不动，用于上次打包失败后重跑）
+set PROVIDER_DECK_SKIP_BUMP=1
+build_all.bat
+```
+
+三条要点，违反任一条都会产出"两个包同一个版本号"或"白吃掉一个版本号"：
+
+1. **不要手工改 patch 号。** 打包会自增，手改必撞车。只有 MINOR / MAJOR 才手改，规则见第 11 节。
+2. **重复打包同版本必须设 `PROVIDER_DECK_SKIP_BUMP=1`**，禁止让补丁号多次无意义自增。
+   用完清掉这个变量，否则下次正式发布不会自增。
+3. **自增只发生在 `build_all.bat` 里，且在测试闸门全绿之后。** 日常开发命令一律不碰版本号；
+   闸门失败时源文件零改动。
+
+打完包后 tag 与 push 需人工执行（刻意不自动化，理由见 11.10）：
+
+```
+git add -A && git commit -m "release: v<version>"
+git tag -a v<version> -m "<说明>"
+git push origin master v<version>
+```
+
+**接手前先读这一节，再读第 10 节与第 11 节，然后才是第 1–9 节。** 第 1–9 节写于 2026-08-11，
+其"最新提交""下一步计划"等描述已被第 10 节取代；两处冲突时以第 10 节为准。
+
 **动版本号之前必读第 11 节。** 补丁号由 `build_all.bat` 打包时自动自增，
 MINOR / MAJOR 才需要手改 —— 手工去改 patch 会与自增撞车。
 
@@ -35,8 +71,11 @@ OpenSpec 变更 `add-model-reasoning-detection`，四模块串行交付，2026-0
 | 模块 1–3 提交 | `6b5481f` feat(reasoning): add local tier detection and tier-linked picker UI（26 文件，+2811/-62） |
 | 模块 4 + 缓存修复提交 | `690cdb6` feat(reasoning): sync preview copy and drop stale detection cache（9 文件，+411/-14） |
 | 归档提交 | `f834d06` docs(openspec): archive reasoning-detection change and merge its specs（11 文件，+503/-11） |
+| 版本自增改造提交 | `131fd96` build(release): auto-bump patch version on formal packaging（12 文件，+1041/-34） |
+| 任务标记提交 | `8d42a8f` docs(openspec): mark release-version-autobump verification tasks done |
 | 分支 | master |
 | 应用版本 | **v0.1.12**（2026-08-13 由自增流程产出，已打包；上一版 v0.1.11） |
+| 发布 tag | `v0.1.12`（annotated）→ `8d42a8f` |
 | 版本升级规则 | 见第 11 节。patch 由 `build_all.bat` 自增，MINOR / MAJOR 手改 |
 | 归档位置 | `openspec/changes/archive/2026-08-13-add-model-reasoning-detection/` |
 | 主规格 | `openspec/specs/` 下 3 个 capability，`openspec validate --specs --strict` 全通过 |
@@ -765,7 +804,88 @@ release 目录，因此会被 `SHA256SUMS.txt` 覆盖）。
 `files`（只匹配 `**/*.{ts,tsx}`）里 —— **vitest 是这些脚本唯一的自动化闸门**，
 改 `bump-version.mjs` 必须同步改 `scripts/bump-version.test.mjs`。
 
-### 11.6 git tag 不自动打
+### 11.6 Release 产物目录结构
+
+`build_all.bat` 产出 `release\ProviderDeck-<version>-windows-x64\`，v0.1.12 实测六个文件：
+
+| 文件 | 大小 | 说明 |
+| --- | --- | --- |
+| `ProviderDeck-Portable-0.1.12-x64.exe` | 15,747,584 B | 便携版，单文件，仅依赖 WebView2 Runtime |
+| `ProviderDeck-Setup-0.1.12-x64.exe` | 3,860,333 B | NSIS 安装版，开始菜单快捷方式 + 卸载项 |
+| `README.txt` | 4,043 B | 中文八段说明，由 `write-release-docs.mjs` 写 |
+| `CHANGELOG.md` | 358 B | 从仓库根复制，`:write_release_notes` 阶段 |
+| `release-summary.txt` | 293 B | 版本号、Build 时间、git commit、rust/cargo/node 版本 |
+| `SHA256SUMS.txt` | 453 B | 覆盖上面五个文件 |
+
+两个 EXE 的 `ProductVersion` 与 `FileVersion` 都要等于目录名里的版本号。
+**核对时读文件属性，别只看文件名** —— 文件名是 bat 拼的，属性来自 `Cargo.toml`，
+只有属性能证明编译真的用了新版本号。PowerShell 一行：
+
+```
+Get-ChildItem release\ProviderDeck-0.1.12-windows-x64\*.exe |
+  ForEach-Object { $_.Name, $_.VersionInfo.ProductVersion }
+```
+
+### 11.7 SHA256 校验清单
+
+`SHA256SUMS.txt` 在 `:write_checksums`（第 12 步）生成，是流程最后一步，
+因此覆盖目录里除自己以外的全部文件。v0.1.12 实测五个条目：
+
+```
+597FEDC921F5A9B5CC41E4C846B0E922504CE785A36F261D51E354EADCD58E28  CHANGELOG.md
+C3E2090DD5DC3289595410A78B26D3D2DE35C77F83B56F81268A79D7EB760B0B  ProviderDeck-Portable-0.1.12-x64.exe
+A33030FF65BD98D83E8576B5AFC92C4460181F02783C26E334A6C53EB111A72D  ProviderDeck-Setup-0.1.12-x64.exe
+20CE9E6E303303ADFF32C077F6A1BF6BC3CFF22537DCE9C4C7E447E00E979417  README.txt
+F3735B815D51EBD68A0AF01950E9D77A57D918B481EEA4992B206327A435C025  release-summary.txt
+```
+
+新增要随包分发的文件时，必须在 `:write_checksums` **之前**放进 release 目录，
+否则它不会进校验清单。CHANGELOG.md 的复制就是为此放在第 11 步。
+
+校验方法：
+
+```
+Get-FileHash release\ProviderDeck-0.1.12-windows-x64\ProviderDeck-Setup-0.1.12-x64.exe -Algorithm SHA256
+```
+
+### 11.8 release-summary.txt 里的 git commit 会落后于发布提交
+
+**已知且无法在当前顺序下消除。** v0.1.12 的 `release-summary.txt` 记的是
+`f834d06`，但真正包含自增脚本的提交是 `131fd96` 与 `8d42a8f`。原因是顺序：
+自增 → 打包（此时采集 git HEAD）→ 人工提交。打包时那两个提交还不存在。
+
+所以那一行的语义是「**构建时的代码基线**」，不是「本次发布对应的提交」。
+要定位发布提交，用 tag：`git rev-list -n1 v0.1.12`。
+
+想让两者一致，只能改成「先提交版本号改动、再打包」，但那样打包失败时就会留下
+一个已提交却没有产物的版本号 —— 比现在这个偏差更难处置。故保持现状。
+
+### 11.9 打包环境变量说明
+
+| 变量 | 取值 | 作用 | 谁设 |
+| --- | --- | --- | --- |
+| `PROVIDER_DECK_SKIP_BUMP` | `1` | 跳过补丁号自增，仍执行 `check-version.mjs` 一致性核对 | 人工，重打同版本时 |
+| `CARGO_HOME` | 路径 | 未设且存在 `.cargo-home` 时，bat 自动指向仓库内缓存 | bat 自动，可由调用方覆盖 |
+| `CARGO_TARGET_DIR` | 路径 | 固定为 `src-tauri\target`，`:prepare_log` 设置，`cargo test` 与 release 编译共用 | bat 强制 |
+
+**重复打包同一版本时统一用 `PROVIDER_DECK_SKIP_BUMP=1`，禁止让补丁号多次自增。**
+
+```
+set PROVIDER_DECK_SKIP_BUMP=1
+build_all.bat
+```
+
+PowerShell 下是 `$env:PROVIDER_DECK_SKIP_BUMP = '1'`。设置后 `BUILD COMPLETE` 会打印
+`(bump skipped via PROVIDER_DECK_SKIP_BUMP)`，据此确认逃生口真的生效了。
+
+用完记得清掉（`set PROVIDER_DECK_SKIP_BUMP=` 或关掉这个终端）—— 忘了清，下一次正式
+发布就不会自增，又回到"两个包同一个版本号"那个病。
+
+另：`cmd /c build_all.bat` 在某些宿主下解析不到裸文件名，报
+`'build_all.bat' is not recognized`。用完整路径 `cmd /c "G:\provider deck\build_all.bat"`。
+这种失败发生在脚本启动前，不会改动任何文件。
+
+### 11.10 git tag 不自动打
 
 仓库现有 `v0.1.11` 一个 tag，说明打 tag 是本项目的惯例，但自增脚本**不自动打 tag、
 不自动 commit、不自动 push**。发布后需要人工：
@@ -777,6 +897,9 @@ git push origin master --tags
 ```
 
 刻意不自动化：tag 与 push 是外向、难回滚的动作，而自增发生在一个可能还要重跑的流程中间。
+
+现有 tag：`v0.1.11`、`v0.1.12`（annotated）。`v0.1.12` 指向 `8d42a8f`，
+注释为「推理档位完整迭代 v0.1.12 正式发布，包含缓存精准失效修复、UI组件统一、版本自动构建脚本」。
 
 ---
 
