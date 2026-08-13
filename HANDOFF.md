@@ -1,10 +1,93 @@
 # Provider Deck 项目交接文档
 
-> 交接时间：2026-08-11 10:45（Asia/Shanghai）
+> 交接时间：2026-08-11 10:45（Asia/Shanghai），2026-08-13 追加第 0 节与第 10 节
 >
-> 交接基线：master / 9a0fd37105000bc511096e3396b44754a4a7d998
+> 交接基线：master / 9a0fd37105000bc511096e3396b44754a4a7d998（第 1–9 节所述状态）
+>
+> 最新提交：master / 690cdb6（第 0 节与第 10 节所述状态）
 >
 > 文档范围：本文件只描述 Provider Deck，项目根目录为 G:\provider deck。不要误在 G:\分屏器（另一个 KVM/分屏项目）中修改。
+
+## 0. 总览小结（新接手者第一阅读项）
+
+**接手前先读这一节，再读第 10 节，然后才是第 1–9 节。** 第 1–9 节写于 2026-08-11，
+其"最新提交""下一步计划"等描述已被第 10 节取代；两处冲突时以第 10 节为准。
+
+### 0.1 推理档位功能交付清单（Phase E，已完整交付）
+
+OpenSpec 变更 `add-model-reasoning-detection`，四模块串行交付，2026-08-13 全部完成并归档。
+
+| 模块 | 交付内容 | 状态 |
+| --- | --- | --- |
+| 1 · 后端探测接口 | `detect_model_reasoning` 本地投影命令、`matching_custom_tiers`、探测缓存 | 已交付 |
+| 2 · 前端契约与档位卡片 | 类型镜像、store action、三段式档位分组、写入场景文案 | 已交付 |
+| 3 · 档位编辑器联动 | 模型卡片新建档位入口、预填规则、落盘后重探与条件自动选中 | 已交付 |
+| 4 · 配置预览文案同步 | `ConfigPreview` 复用同一文案组件、`omitted` 场景说明 | 已交付 |
+| 4a · 附加缓存修复 | `invalidate_detection_cache`，消除重探后最长 6 小时的脏窗口 | 已交付 |
+
+### 0.2 版本号
+
+| 项 | 值 |
+| --- | --- |
+| 模块 1–3 提交 | `6b5481f` feat(reasoning): add local tier detection and tier-linked picker UI（26 文件，+2811/-62） |
+| 模块 4 + 缓存修复提交 | `690cdb6` feat(reasoning): sync preview copy and drop stale detection cache（9 文件，+411/-14） |
+| 分支 | master |
+| 应用版本 | v0.1.11（本次未改版本号，未发新 Release） |
+| 归档位置 | `openspec/changes/archive/2026-08-13-add-model-reasoning-detection/` |
+| 主规格 | `openspec/specs/` 下 3 个 capability，`openspec validate --specs --strict` 全通过 |
+
+### 0.3 闸门基准数据汇总
+
+| 闸门 | Phase D 基线 | Phase E 起点 | 模块1 | 模块2 | 模块3 | 模块4 | 终值 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `cargo test --lib` | 200 | 271 | 282 | 282 | 282 | 284 | **284** |
+| `npm run test`（vitest） | 66 | 99 | 99 | 138 | 149 | 154 | **154** |
+| `npx playwright test` | 47 | 62 | 62 | 62 | 66 | 66 | **66**（65 passed + 1 既有 skip） |
+| `tsc --noEmit -p tsconfig.app.json` | 0 errors | — | — | — | — | — | **0 errors** |
+| `npm run lint` | 0 warnings | — | — | — | — | — | **0 warnings** |
+
+那条 skip 是 `e2e/onboarding.spec.ts:468` 既有的 `test.skip(project !== "narrow-chromium")`，
+在 desktop project 下自跳，与本次改动无关。
+
+### 0.4 全迭代实现偏差与特殊逻辑（改代码前必读）
+
+下面每一条都是刻意如此，且有测试钉住。当成 bug"修回去"会直接破坏已验收的行为。
+
+| # | 事项 | 为什么这样 |
+| --- | --- | --- |
+| 1 | 档位弹窗回调是 `onSave(tier, rule?)`，不是 `onSaved(tier)` | 弹窗只回传规则草稿，落盘归宿主，组件保持零 store 依赖，设置页与向导共用同一个弹窗 |
+| 2 | 自动选中写 `reasoningFallbacks`（逐模型兜底），不写名称规则 | 规则是首命中优先，排在前面的旧规则会遮蔽刚建的档位；逐模型兜底是唯一能保证生效的表达 |
+| 3 | 预填规则被清空即不建规则 | 空 pattern 会命中一切模型，存下去比不存危险 |
+| 4 | `ConfigPreview` 与 `ReasoningTierPicker` 共用 `WriteTargetNote` 组件，不各自调 `writeTargetSummary` | 共用函数只保证句子相同，保不住徽章与排版相同 |
+| 5 | 缓存作废只看键、不看 TTL，因此连过期条目一起删 | `detection_cache_hit` 才看 TTL。给作废也加 TTL 过滤会让过期条目在 `state.json` 里永久堆积 |
+| 6 | 写不出参数的档位仍然展示，只加"当前端点无可写参数"标注 | 隐藏会让用户以为保存失败 |
+| 7 | `builtinTiersCompatible` 是三值 `true/false/null` | 用 `false` 表达"不知道"会把未探明伪装成不兼容，那正是本次要修的病 |
+| 8 | 缓存键在前端是 `${providerId.length}:${providerId}:${modelId}` | 长度前缀防止 `a:b` + `c` 与 `a` + `b:c` 撞键 |
+
+### 0.5 不可违反的边界约束
+
+1. **不碰 `resolve_binding` 实时链路。** 实时请求的推理参数恒为 Omitted，只有配置写入层应用档位。
+2. **`detect_model_reasoning` 零出站请求。** 它只投影本地已有数据，且不写 `ModelInfo.reasoning` /
+   `confidence` / `reasoningVerifications`。`ConfigPreview` 同理——只读视图，打开不产生任何请求。
+   要真的重探走 `reprobe_model_reasoning`。
+3. **不用模型名推断能力。** 不新增硬编码模型清单。Anthropic / Gemini 无自定义档位时回落全局兜底，
+   不编造推理数值。
+4. **新增结构体字段必须带 `#[serde(default)]`。** 旧 `state.json` 必须无损加载。
+5. **文案纪律。** 设定性取值（自定义档位、全局回退档）绝不使用「支持 / 兼容 / 已确认 / 已验证 /
+   已探明」；只有 discovery 真探到能力时才允许说「已探明」；所有写入说明恒附
+   「仅用于写入配置文件，实时请求不发送推理参数。」
+6. **密钥不落地。** 错误输出、日志、弹窗、缓存条目、配置文件一律不含密钥片段。
+   第 1 节的六条硬性业务约束继续全部有效。
+
+### 0.6 UI 组件复用规则
+
+- 「配置写入哪一档」这句话只有一处实现：`src/domain/reasoning.ts` 的 `writeTargetSummary`。
+- 渲染也只有一处：`ReasoningTierPicker.tsx` 导出的 `WriteTargetNote`。新增展示位置要复用它，
+  不要新写一个 note 组件。
+- 档位分组只有一处：`tierPickerGroups`。
+- 「档位在当前端点能否写出参数」只有一处：`tierWritableAtEndpoint`；`autoSelectableTier` 调它。
+- `omitted` 文案取自 `originLabel("omitted")`，不新造字符串。
+- 新增任何展示位置时，先找既有函数/组件，找不到再新增——这一套的全部价值就在"只有一处实现"。
 
 ## 1. 项目标识（Project Identity）
 
@@ -541,11 +624,6 @@ vitest（5 例，`ConfigPreview.test.tsx`）：
 模块 4 未新增 E2E：文案一致性由 4.4 的跨组件断言覆盖，且该断言比 E2E 更强——
 它逐字比对两个组件的渲染文本，E2E 只能分别断言各自出现了某段文字。
 
-### 10.9 下一轮：本次变更已可归档
-
-模块 1–4 全部完成，`openspec/changes/add-model-reasoning-detection/tasks.md` 全项勾选。
-下一轮可走 `openspec-archive-change`，把三份 spec 合入 `openspec/specs/`。归档前无未决项。
-
 ### 10.5 文件修改记录
 
 Rust 侧改动集中在模块 1；模块 2、3 为纯前端。整阶段 17 个文件，2121 insertions / 62 deletions。
@@ -611,6 +689,9 @@ E2E 那条 skipped 是 `e2e/onboarding.spec.ts:468` 既有的 `test.skip(project
 
 ## 会话启动摘要（Session Resume Prompt）
 
+> **已过期，保留作历史记录。** 这段写于 2026-08-11，其基线 commit 与"最高优先级"两条已被
+> Phase E 取代。新会话请用文末的《交接启动 Prompt（终版）》。
+
 ~~~text
 你正在维护 Provider Deck，项目根目录是 G:\provider deck，不是 G:\分屏器。
 基线：master，HEAD 9a0fd37105000bc511096e3396b44754a4a7d998，工作树应保持干净；v0.1.11 已发布。
@@ -623,3 +704,78 @@ E2E 那条 skipped 是 `e2e/onboarding.spec.ts:468` 既有的 `test.skip(project
 
 修改后至少运行：npm run lint；npm test -- --run；cargo test --manifest-path src-tauri\Cargo.toml。涉及 UI 再运行 npm run test:e2e；发布前运行 build_all.bat。
 ~~~
+
+---
+
+## 交接启动 Prompt（终版，2026-08-13）
+
+新 AI 接手时把下面整段作为首条输入。它自带全部约束，不需要先读完本文档。
+
+~~~text
+你在维护 Provider Deck：Tauri 2 + React 的本地优先 AI Provider 配置中心。
+项目根目录 G:\provider deck，不是 G:\分屏器。分支 master，HEAD 690cdb6，v0.1.11 已发布。
+先读 HANDOFF.md 第 0 节与第 10 节；第 1-9 节写于 2026-08-11，与第 10 节冲突时以第 10 节为准。
+
+【三套工作规则】
+1. caveman：压缩上下文，精简冗余表述；但安全红线、架构边界、测试规则、UI 文案规范必须逐字保留。
+2. karpathy-skills：持续拦截反模式——缺 #[serde(default)] 的结构体、前后端类型不同步、
+   跨模块违规导入、跳过单元/E2E 测试、编造模型 API、私改已验收模块。
+3. OpenSpec：先出规格再动手。确认边界、改动文件、测试用例、UI 文案，分模块串行开发，
+   单模块五道闸门全绿并经用户确认才进下一个。规格在 openspec/specs/，
+   历史变更在 openspec/changes/archive/。
+
+【五道闸门，改完必跑】
+cargo test --lib --manifest-path src-tauri/Cargo.toml   基线 284
+node_modules/.bin/tsc --noEmit -p tsconfig.app.json      须 0 errors
+npm run test                                             基线 154
+npm run lint                                             须 0 warnings（--max-warnings 0）
+npx playwright test                                      基线 66（65 passed + 1 既有 narrow-only skip）
+e2e/** 不被任何 tsconfig 覆盖，tsc 看不到它——改过 e2e 必须重跑 npm run lint，那是它唯一的闸门。
+playwright 的 project 名是 desktop-chromium 与 narrow-chromium，没有 chromium。
+
+【安全红线，触碰即停】
+1. API Key 只存系统凭据库。不得进入 Provider JSON、日志、导出、诊断输出、探测缓存、Git。
+2. 本地协议代理只监听 127.0.0.1。每个 Provider 独立本地令牌，Codex 配置只存本地令牌，
+   不存上游 Key。
+3. 配置写入必须走合并→预览→外部修改校验→备份→原子替换→失败回滚，默认"只生成配置"。
+4. Codex catalog 的 apply_patch_tool_type 只能是 freeform 或省略，绝不能写 function。
+5. 能力必须接口探测，禁止按模型名硬编码或维护黑白名单。
+6. 新增结构体字段必须带 #[serde(default)]，旧 state.json 必须无损加载。
+
+【推理档位模块的专属边界】
+1. 不碰 resolve_binding 实时链路：实时请求的推理参数恒为 Omitted，只有配置写入层应用档位。
+2. detect_model_reasoning 零出站请求，只投影本地数据，且不写 ModelInfo.reasoning /
+   confidence / reasoningVerifications。ConfigPreview 同理，只读视图不产生请求。
+   要真的重探走 reprobe_model_reasoning，它会同步作废探测缓存。
+3. 文案纪律：设定性取值（自定义档位、全局回退档）绝不使用"支持/兼容/已确认/已验证/已探明"；
+   只有 discovery 真探到能力才允许说"已探明"；所有写入说明恒附
+   "仅用于写入配置文件，实时请求不发送推理参数。"
+4. 只有一处实现的东西不要复制：写入文案 writeTargetSummary、渲染 WriteTargetNote、
+   分组 tierPickerGroups、可写性 tierWritableAtEndpoint。新增展示位置先复用。
+5. HANDOFF 第 0.4 节列了 8 条刻意的实现偏差，全部有测试钉住。当成 bug 改回去会破坏已验收行为。
+
+【协作方式】
+逐模块汇报后停下等确认，不要一口气做完四个模块。
+不要自动创建 git commit——除非用户明确说"提交"。push 同理。
+禁改清单要遵守：已验收的客户端模块、Codex 环境变量鉴权、SupportLevel 枚举、
+Task C 自定义档位与分层兜底、五道闸门定义。只做新增扩展。
+~~~
+
+### 双 AI 分工建议
+
+以下是**建议**而非既有约定——此前所有开发由单个会话完成。若确实要两个 AI 并行，按能力边界分，
+不要按文件分：
+
+| 角色 | 职责 | 交付物 |
+| --- | --- | --- |
+| 规格与验证方 | 写 OpenSpec 规格、定测试用例与 UI 文案规范、跑五道闸门、审实现是否越界 | `openspec/changes/<id>/` 全套、闸门报告、越界清单 |
+| 实现方 | 按已确认的规格与任务清单改代码、补测试 | 代码改动 + 测试，逐模块交付 |
+
+两条硬性要求：
+
+1. **同一时刻只有一方写代码。** 两个 AI 同时改同一棵工作树，`git status` 会互相污染，
+   而本项目的五道闸门是全量跑的——另一方改坏了，报告会算到你头上。
+2. **规格未确认不得开工。** 这是 OpenSpec 流程的全部意义。实现方发现规格有问题要退回，
+   不能自行改规格再照改的实现。
+
+单 AI 会话反而更契合本项目的逐模块串行节奏。除非有明确的并行收益，否则不建议拆。
