@@ -10,8 +10,11 @@
 
 ## 0. 总览小结（新接手者第一阅读项）
 
-**接手前先读这一节，再读第 10 节，然后才是第 1–9 节。** 第 1–9 节写于 2026-08-11，
+**接手前先读这一节，再读第 10 节与第 11 节，然后才是第 1–9 节。** 第 1–9 节写于 2026-08-11，
 其"最新提交""下一步计划"等描述已被第 10 节取代；两处冲突时以第 10 节为准。
+
+**动版本号之前必读第 11 节。** 补丁号由 `build_all.bat` 打包时自动自增，
+MINOR / MAJOR 才需要手改 —— 手工去改 patch 会与自增撞车。
 
 ### 0.1 推理档位功能交付清单（Phase E，已完整交付）
 
@@ -31,8 +34,10 @@ OpenSpec 变更 `add-model-reasoning-detection`，四模块串行交付，2026-0
 | --- | --- |
 | 模块 1–3 提交 | `6b5481f` feat(reasoning): add local tier detection and tier-linked picker UI（26 文件，+2811/-62） |
 | 模块 4 + 缓存修复提交 | `690cdb6` feat(reasoning): sync preview copy and drop stale detection cache（9 文件，+411/-14） |
+| 归档提交 | `f834d06` docs(openspec): archive reasoning-detection change and merge its specs（11 文件，+503/-11） |
 | 分支 | master |
-| 应用版本 | v0.1.11（本次未改版本号，未发新 Release） |
+| 应用版本 | **v0.1.12**（2026-08-13 由自增流程产出，已打包；上一版 v0.1.11） |
+| 版本升级规则 | 见第 11 节。patch 由 `build_all.bat` 自增，MINOR / MAJOR 手改 |
 | 归档位置 | `openspec/changes/archive/2026-08-13-add-model-reasoning-detection/` |
 | 主规格 | `openspec/specs/` 下 3 个 capability，`openspec validate --specs --strict` 全通过 |
 
@@ -45,6 +50,10 @@ OpenSpec 变更 `add-model-reasoning-detection`，四模块串行交付，2026-0
 | `npx playwright test` | 47 | 62 | 62 | 62 | 66 | 66 | **66**（65 passed + 1 既有 skip） |
 | `tsc --noEmit -p tsconfig.app.json` | 0 errors | — | — | — | — | — | **0 errors** |
 | `npm run lint` | 0 warnings | — | — | — | — | — | **0 warnings** |
+
+v0.1.12（版本自增改造，2026-08-13）之后的基线：vitest **178 通过 / 8 文件**
+（`scripts/bump-version.test.mjs` 新增 24 例），其余四道闸门数值不变
+（cargo 284、tsc 0、lint 0、playwright 66 收集 / 65 通过 / 1 既有 skip）。
 
 那条 skip 是 `e2e/onboarding.spec.ts:468` 既有的 `test.skip(project !== "narrow-chromium")`，
 在 desktop project 下自跳，与本次改动无关。
@@ -63,6 +72,9 @@ OpenSpec 变更 `add-model-reasoning-detection`，四模块串行交付，2026-0
 | 6 | 写不出参数的档位仍然展示，只加"当前端点无可写参数"标注 | 隐藏会让用户以为保存失败 |
 | 7 | `builtinTiersCompatible` 是三值 `true/false/null` | 用 `false` 表达"不知道"会把未探明伪装成不兼容，那正是本次要修的病 |
 | 8 | 缓存键在前端是 `${providerId.length}:${providerId}:${modelId}` | 长度前缀防止 `a:b` + `c` 与 `a` + `b:c` 撞键 |
+| 9 | 版本自增改四个文件，不是需求写的两个 | `tauri.conf.json` 漏改会让 `check-version.mjs` 在下一步自己失败；`Cargo.lock` 漏改会让工作树每次发布后变脏 |
+| 10 | 版本自增排在测试闸门之后，不在打包最前面 | 放前面会让每次闸门失败都白吃掉一个版本号，并留下没有产物的脏工作树 |
+| 11 | `build_all.bat` 三个临时文件路径拆开，不复用一个变量 | `DisableDelayedExpansion` 把 `%RANDOM%` 冻结在启动那一刻；清理失败时后一步会把前一步的残留当成自己的结果 |
 
 ### 0.5 不可违反的边界约束
 
@@ -684,6 +696,87 @@ E2E 那条 skipped 是 `e2e/onboarding.spec.ts:468` 既有的 `test.skip(project
    `reasoningVerifications` 中任何一处。
 3. Anthropic / Gemini 协议在没有自定义档位时编造推理数值 —— 必须回落全局兜底。
 4. 用模型名推断能力，或为新增结构体省掉 `#[serde(default)]`（旧 `state.json` 必须无损加载）。
+
+---
+
+## 11. 版本号升级规则（2026-08-13 起生效）
+
+### 11.1 三段号各自谁来改
+
+| 段位 | 谁改 | 触发条件 | 怎么改 |
+| --- | --- | --- | --- |
+| **PATCH**（0.1.**x**） | `build_all.bat` 自动 | 每次正式打包 | 无需人工。`:bump_version` 在测试闸门全绿后自增 |
+| **MINOR**（0.**x**.0） | 人工 | 破坏性接口变更、架构调整 | 手改 `package.json` 的 version 后再打包；打包会在此基础上自增 patch |
+| **MAJOR**（**x**.0.0） | 人工 | 重大重构、对外 API 不兼容 | 同上 |
+
+手工改 MINOR / MAJOR 时把 patch 归零写成 `0.2.0`，下一次打包会产出 `0.2.1`。
+若希望发布的正是 `0.2.0` 本身，改完设 `PROVIDER_DECK_SKIP_BUMP=1` 打包一次。
+
+**「破坏性」以数据与外部契约为准，不以改动量为准。** 典型 MINOR 场景：
+`state.json` 字段语义变更导致旧文件无法无损加载；Tauri 命令签名或返回结构变更；
+写入第三方客户端配置的格式变更；`SupportLevel` 等跨层枚举增删成员。
+纯内部重构、UI 文案、测试与文档一律走 PATCH。
+
+### 11.2 自增改的是四个文件，不是两个
+
+`scripts/bump-version.mjs` 以 `package.json` 的 version 为唯一输入，同步写入：
+
+| 文件 | 为什么必须跟着改 |
+| --- | --- |
+| `package.json` | 发布文件名与 npm 元数据 |
+| `src-tauri/Cargo.toml` `[package]` 段 | exe 的文件属性 |
+| `src-tauri/tauri.conf.json` | 安装包写进注册表的版本。`check-version.mjs` 已在核对它，漏改会让 bat 在下一步自己失败 |
+| `src-tauri/Cargo.lock` 的 `provider-deck` 条目 | 漏改则每次发布后工作树变脏；将来若给 cargo 加 `--locked` 会直接构建失败 |
+
+另外在 `CHANGELOG.md` 顶部插入本次版本小节（仓库根一份，`:write_release_notes` 再复制进
+release 目录，因此会被 `SHA256SUMS.txt` 覆盖）。
+
+写入是全有或全无：四份新内容先在内存里全部算好，任一处算不出就中止，一个字节都不写。
+落盘后回读四处自检，再由 `check-version.mjs` 独立核对一遍 —— 脚本确认自己的输出只算一个证人。
+
+### 11.3 为什么自增排在测试闸门之后
+
+`:bump_version` 在 `:run_tests` 之后、`:prepare_release_dir` 之前。放在最前面的话，
+任何一次 cargo / tsc / vitest / eslint 失败都会留下一个已自增但没有产物的版本号，
+版本号被白吃掉且工作树变脏。闸门全绿才自增，失败时源文件零改动。
+
+连带的结构调整：原 `:prepare_output` 拆成 `:prepare_log`（建日志 + 并发守卫 + 设
+`CARGO_TARGET_DIR`，必须在测试前）与 `:prepare_release_dir`（建版本目录，必须在自增后，
+因为目录名含版本号）。步骤编号 10 → 12。全部既有守卫原样保留。
+
+测试跑在旧版本号上、产物打在新版本号上，这是刻意的：版本号不参与任何测试逻辑。
+
+### 11.4 逃生口与失败后的处置
+
+`PROVIDER_DECK_SKIP_BUMP=1` 跳过自增，仍走 `check-version.mjs` 核对。用途：
+上一次打包在自增之后、产物阶段之前失败（WiX 拉不下来、libc os error 5、EXE 被占用），
+重跑时不该再吃掉一个版本号。
+
+打包失败且已自增时，`BUILD FAILED` 区块会明确打印「版本已升到 x.y.z」并给两条出路
+（设 `PROVIDER_DECK_SKIP_BUMP=1` 重打，或回滚五个文件的版本改动）。
+不要相信「源文件未改动」那句 —— 它只在未自增时才打印。
+
+### 11.5 日常开发不受影响
+
+`npm run dev` / `tauri dev` / 五道闸门命令全部不碰版本号。仓库里唯一自增版本号的地方
+就是 `build_all.bat`，且只有真正走到打包才会触发。
+
+`scripts/**` 的 `.mjs` 不在 `tsconfig.app.json` 的 `include` 里，也不在 eslint 的
+`files`（只匹配 `**/*.{ts,tsx}`）里 —— **vitest 是这些脚本唯一的自动化闸门**，
+改 `bump-version.mjs` 必须同步改 `scripts/bump-version.test.mjs`。
+
+### 11.6 git tag 不自动打
+
+仓库现有 `v0.1.11` 一个 tag，说明打 tag 是本项目的惯例，但自增脚本**不自动打 tag、
+不自动 commit、不自动 push**。发布后需要人工：
+
+```
+git add -A && git commit -m "release: v<version>"
+git tag v<version>
+git push origin master --tags
+```
+
+刻意不自动化：tag 与 push 是外向、难回滚的动作，而自增发生在一个可能还要重跑的流程中间。
 
 ---
 

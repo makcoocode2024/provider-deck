@@ -1,6 +1,6 @@
 [package]
 name = "provider-deck"
-version = "0.1.11"
+version = "0.1.12"
 description = "Local-first AI provider configuration manager"
 authors = ["Provider Deck contributors"]
 edition = "2021"
